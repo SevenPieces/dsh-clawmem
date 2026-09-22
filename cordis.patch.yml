@@ -1,0 +1,15 @@
+- insert:
+    - id: memory-clawmem
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: clawmem
+        transport: stdio
+        # R-2: no machine path is shipped. The loader evaluates this row, so the
+        # command is derived at boot: $CLAWMEM_BIN when set, else the standard
+        # npm-global location under $HOME (pin CLAWMEM_BIN when it lives elsewhere).
+        command: !!js "(process.env.CLAWMEM_BIN || '').trim() || (process.env.HOME ? process.env.HOME + '/.npm-global/bin/clawmem' : 'clawmem')"
+        args: ['mcp']
+        cwd: !!js "process.cwd()"
+
+    - id: dsh-clawmem
+      name: 'dsh-clawmem'

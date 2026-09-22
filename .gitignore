@@ -1,0 +1,13 @@
+# Owner-only working document: private planning notes. npm already excludes it
+# through the package.json "files" allowlist; this keeps it out of the repository
+# (and out of a clone) as well.
+DECISIONS.md
+
+# Local, non-distributed baseline: the verbatim upstream ClawMem routing block that
+# routing-block.dsh.md is adapted from. Never committed, wherever it is kept.
+clawmem_option_b_trigger_block.md
+
+# Pack/install scratch, never committed.
+*.tgz
+node_modules/
+.DS_Store

@@ -1,0 +1,38 @@
+{
+  "name": "dsh-clawmem",
+  "version": "0.1.0",
+  "description": "ClawMem parity for DSH: automatic surfacing, throttled per-turn extraction, pre/post-compaction capture, transcript, skill + routing block, and the MCP client row",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    ".": "./lib/index.js"
+  },
+  "files": [
+    "lib/",
+    "routing-block.dsh.md",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "prepublishOnly": "node --test tests/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SevenPieces/dsh-clawmem.git"
+  },
+  "homepage": "https://github.com/SevenPieces/dsh-clawmem#readme",
+  "bugs": {
+    "url": "https://github.com/SevenPieces/dsh-clawmem/issues"
+  }
+}
