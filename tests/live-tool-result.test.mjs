@@ -168,6 +168,59 @@ test('T-F1: an identical re-delivery of the same live v4 tool result is appended
   }
 })
 
+// --- T-ADV4-04 (INFO, pre-existing): the tool-result path's generic
+//     `typeof block.text === 'string'` fallback included a reasoning block, so a
+//     live v4 tool result whose content mixes reasoning and text leaked private
+//     reasoning text into the transcript. ContentBlock is role-neutral, so the
+//     shape is type-legal. Only `reasoning` is excluded; an unknown text-bearing
+//     block keeps its existing pass-through behaviour.
+test('T-ADV4-04: a reasoning block in a live v4 tool result is excluded from the transcript', () => {
+  const env = setup()
+  try {
+    const { ctx, handlers } = makeCtx()
+    apply(ctx, { clawmemBin: env.bin, transcript: { dir: env.root, rotation: { enabled: false } } })
+    emitToolResult(handlers, { id: 'sess-live-reasoning', header: {} }, liveMessage({
+      toolCallId: 'call_reasoning',
+      isError: false,
+      content: [
+        { type: 'reasoning', text: 'PRIVATE' },
+        { type: 'text', text: 'visible' },
+      ],
+    }))
+    const lines = readTranscript(env.root, 'sess-live-reasoning')
+    assert.equal(lines.length, 1)
+    const block = lines[0].message.content[0]
+    assert.equal(block.tool_use_id, 'call_reasoning')
+    assert.equal(block.content, 'visible',
+      'only the text block may reach the transcript, got ' + JSON.stringify(block.content))
+    assert.ok(!JSON.stringify(lines[0]).includes('PRIVATE'),
+      'reasoning text must not leak into the transcript: ' + JSON.stringify(lines[0]))
+  } finally {
+    rmSync(env.root, { recursive: true, force: true })
+  }
+})
+
+test('T-ADV4-04 control: an unknown non-reasoning text-bearing block is still kept', () => {
+  const env = setup()
+  try {
+    const { ctx, handlers } = makeCtx()
+    apply(ctx, { clawmemBin: env.bin, transcript: { dir: env.root, rotation: { enabled: false } } })
+    emitToolResult(handlers, { id: 'sess-live-unknown-block', header: {} }, liveMessage({
+      toolCallId: 'call_unknown',
+      isError: false,
+      content: [
+        { type: 'notice', text: 'kept text' },
+        { type: 'text', text: 'visible' },
+      ],
+    }))
+    const block = readTranscript(env.root, 'sess-live-unknown-block')[0].message.content[0]
+    assert.equal(block.content, 'kept text' + LF + 'visible',
+      'an unknown non-reasoning text block must keep its existing behaviour, got ' + JSON.stringify(block.content))
+  } finally {
+    rmSync(env.root, { recursive: true, force: true })
+  }
+})
+
 test('T-F1 control: a legacy block-level toolCallId result still maps (replay compatibility)', () => {
   const env = setup()
   try {

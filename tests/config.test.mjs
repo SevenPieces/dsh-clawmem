@@ -345,66 +345,90 @@ test('F-2: an invalid skill.name is repaired loudly and falls back to clawmem', 
   assert.deepEqual(configIssues({}), [], 'an absent skill section is a default, not a repair')
 })
 
-// --- T-ADV3-01 (MEDIUM): a rotation sweep interval above the 32-bit timer
-//     maximum was passed to setInterval() unchanged. Node clamps such a delay to
-//     1 ms (TimeoutOverflowWarning), turning a monthly/yearly pruning interval
-//     into a busy sweep loop. The config repair must clamp it to the largest
-//     whole-hour delay the timer accepts: floor((2**31 - 1) / 3600000) = 596 h.
-const MAX_SWEEP_HOURS = 596
+// --- T-ADV4-01 (LOW; corrects the ADV3-01 boundary): the sweep interval was
+//     repaired against the whole-hour cap (596 h) instead of the real millisecond
+//     timer maximum. 596 h = 2145600000 ms and 596.1 h = 2145960000 ms both FIT
+//     the 32-bit timer range, so neither may be repaired; only an interval whose
+//     millisecond form really overflows (596.6 h = 2147760000 ms, 720 h) is
+//     repaired - to the platform maximum, so setInterval receives exactly
+//     2147483647 ms and never Node's 1 ms overflow clamp. The repair warning is a
+//     user-visible claim: it must name 2147483647 ms and must not repeat the false
+//     equivalence "596 h = 2147483647 ms" (596 h is 2145600000 ms).
+const MAX_TIMER_MS = 2147483647
+const MS_PER_HOUR = 3600000
+const FALSE_596_EQUIVALENCE = [
+  /596\s*h(?:ours?)?\s*\(\s*2147483647/i,
+  /596\s*h(?:ours?)?\s*(?:=|equals?|is)\s*2147483647/i,
+]
 
-test('T-ADV3-01: a rotation sweep interval above the timer maximum is repaired to 596 h and reported', () => {
-  const repaired = resolveConfig({ transcript: { rotation: { sweepIntervalHours: 720 } } })
-  assert.equal(repaired.transcript.rotation.sweepIntervalHours, MAX_SWEEP_HOURS,
-    '720 h (2592000000 ms) exceeds the 32-bit timer maximum and must be clamped to 596 h')
-  const issues = configIssues({ transcript: { rotation: { sweepIntervalHours: 720 } } })
-  assert.equal(issues.length, 1, 'exactly one repair issue, got ' + JSON.stringify(issues))
-  assert.ok(issues[0].includes('transcript.rotation.sweepIntervalHours'),
-    'the issue names the repaired key: ' + issues[0])
-
-  // The maximum itself is a valid configured value and is not reported.
-  assert.equal(resolveConfig({ transcript: { rotation: { sweepIntervalHours: MAX_SWEEP_HOURS } } }).transcript.rotation.sweepIntervalHours, MAX_SWEEP_HOURS)
-  assert.deepEqual(configIssues({ transcript: { rotation: { sweepIntervalHours: MAX_SWEEP_HOURS } } }), [],
-    '596 h is accepted without a repair issue')
-
-  // The boundary is exact: one hour above the maximum repairs too.
-  assert.equal(resolveConfig({ transcript: { rotation: { sweepIntervalHours: 597 } } }).transcript.rotation.sweepIntervalHours, MAX_SWEEP_HOURS,
-    '597 h (2149200000 ms) is one hour past the maximum and must be repaired to 596 h')
-  const above = configIssues({ transcript: { rotation: { sweepIntervalHours: 597 } } })
-  assert.equal(above.length, 1, '597 h is repaired and reported: ' + JSON.stringify(above))
-  assert.ok(above[0].includes('transcript.rotation.sweepIntervalHours'), 'the issue names the key: ' + above[0])
+test('T-ADV4-01: rotation sweep intervals that fit the millisecond timer range are accepted silently', () => {
+  for (const hours of [596, 596.1]) {
+    const raw = { transcript: { rotation: { sweepIntervalHours: hours } } }
+    assert.equal(resolveConfig(raw).transcript.rotation.sweepIntervalHours, hours,
+      hours + ' h is ' + (hours * MS_PER_HOUR) + ' ms and fits the platform maximum ' + MAX_TIMER_MS + ' ms; it must be kept')
+    assert.deepEqual(configIssues(raw), [], hours + ' h fits the 32-bit timer range and must not be reported')
+  }
 })
 
-test('T-ADV3-01: the interval handed to setInterval for a 720 h config is within the platform range', () => {
-  const root = mkdtempSync(join(tmpdir(), 'clawmem-rotation-interval-'))
-  // Capture the delay without scheduling a real timer: the defect is the value
-  // handed to setInterval, and a real overflowing timer would clamp to 1 ms and
-  // sweep in a loop.
+test('T-ADV4-01: rotation sweep intervals whose millisecond form overflows are repaired with one honest issue', () => {
+  for (const hours of [596.6, 720]) {
+    const raw = { transcript: { rotation: { sweepIntervalHours: hours } } }
+    const repaired = resolveConfig(raw).transcript.rotation.sweepIntervalHours
+    assert.notEqual(repaired, hours, hours + ' h is ' + (hours * MS_PER_HOUR) + ' ms and must be repaired')
+    assert.ok(repaired * MS_PER_HOUR <= MAX_TIMER_MS,
+      'the repaired value ' + repaired + ' h is ' + (repaired * MS_PER_HOUR) + ' ms, above the platform maximum ' + MAX_TIMER_MS + ' ms')
+    // The repaired value is itself in range: resolving it must not warn again.
+    assert.deepEqual(configIssues({ transcript: { rotation: { sweepIntervalHours: repaired } } }), [],
+      'the repaired value ' + repaired + ' h must resolve silently')
+
+    const issues = configIssues(raw)
+    assert.equal(issues.length, 1, 'exactly one repair issue for ' + hours + ' h, got ' + JSON.stringify(issues))
+    const message = issues[0]
+    assert.ok(message.includes('transcript.rotation.sweepIntervalHours'), 'the issue names the repaired key: ' + message)
+    assert.ok(message.includes(String(MAX_TIMER_MS)), 'the issue names the millisecond timer maximum ' + MAX_TIMER_MS + ': ' + message)
+    assert.match(message, /ms\b|millisecond/i, 'the issue names the millisecond unit: ' + message)
+    for (const pattern of FALSE_596_EQUIVALENCE) {
+      assert.doesNotMatch(message, pattern,
+        'the issue must not claim 596 h equals 2147483647 ms (596 h is 2145600000 ms): ' + message)
+    }
+  }
+})
+
+test('T-ADV4-01: an overflowing sweep interval reaches setInterval as the exact platform maximum', () => {
   const realSetInterval = globalThis.setInterval
-  const captured = []
-  globalThis.setInterval = function (fn, delay) {
-    captured.push(delay)
-    return { unref() {}, ref() {} }
-  }
-  let dispose
-  try {
-    const { ctx } = makeCtx()
-    dispose = apply(ctx, {
-      clawmemBin: '/bin/false',
-      transcript: { dir: root, rotation: { enabled: true, sweepIntervalHours: 720 } },
-    })
-  } finally {
-    globalThis.setInterval = realSetInterval
-  }
-  try {
-    assert.equal(captured.length, 1, 'rotation registers exactly one interval: ' + JSON.stringify(captured))
-    const delay = captured[0]
-    assert.ok(delay <= 2147483647,
-      'the delay passed to setInterval must fit the 32-bit timer limit, got ' + delay)
-    assert.notEqual(delay, 1,
-      "an overflowing interval must never reach setInterval as Node's 1 ms clamp")
-  } finally {
-    if (typeof dispose === 'function') dispose()
-    rmSync(root, { recursive: true, force: true })
+  for (const hours of [596.6, 720]) {
+    const root = mkdtempSync(join(tmpdir(), 'clawmem-rotation-interval-'))
+    // Capture the delay without scheduling a real timer: the defect is the value
+    // handed to setInterval, and a real overflowing timer would clamp to 1 ms and
+    // sweep in a loop.
+    const captured = []
+    globalThis.setInterval = function (fn, delay) {
+      captured.push(delay)
+      return { unref() {}, ref() {} }
+    }
+    let dispose
+    try {
+      const { ctx } = makeCtx()
+      dispose = apply(ctx, {
+        clawmemBin: '/bin/false',
+        transcript: { dir: root, rotation: { enabled: true, sweepIntervalHours: hours } },
+      })
+    } finally {
+      globalThis.setInterval = realSetInterval
+    }
+    try {
+      assert.equal(captured.length, 1, 'rotation registers exactly one interval for ' + hours + ' h: ' + JSON.stringify(captured))
+      const delay = captured[0]
+      assert.ok(delay <= MAX_TIMER_MS,
+        'the delay passed to setInterval must fit the 32-bit timer limit, got ' + delay)
+      assert.notEqual(delay, 1,
+        "an overflowing interval must never reach setInterval as Node's 1 ms clamp")
+      assert.equal(delay, MAX_TIMER_MS,
+        'the repaired interval must reach setInterval as exactly ' + MAX_TIMER_MS + ' ms, got ' + delay)
+    } finally {
+      if (typeof dispose === 'function') dispose()
+      rmSync(root, { recursive: true, force: true })
+    }
   }
 })
 

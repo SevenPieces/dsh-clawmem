@@ -12,7 +12,9 @@ One ESM Cordis plugin (`lib/index.js`) that:
 
 - surfaces relevant vault context automatically on prompt (`agent/pre-step`, `context-surfacing`)
   whenever the prompt is at least `surfacing.minPromptChars` long;
-- runs `session-bootstrap`, `curator-nudge`, and `staleness-check` once at session start;
+- runs `session-bootstrap`, `curator-nudge`, and `staleness-check` once on the startup announcement
+  (`agent/created` with `source: startup`; resume, clear and compact are skipped, and an omitted
+  source is treated as startup);
 - captures pre-compaction state before summarization and re-injects authoritative post-compaction
   context (the pending flag is cleared only after a successful `postcompact-inject`);
 - runs throttled **per-turn** extraction (`decision-extractor`, `handoff-generator`,
@@ -119,12 +121,16 @@ extraction, or delete such scratch first, before treating a red run as a regress
 
 Every value below is the code's actual default and is read from the Cordis plugin config at
 activation; a malformed value is repaired to that default and logged at warn (fail-open).
-Values that arm a Node timer are additionally capped at the platform maximum - `2147483647` ms,
-i.e. 596 whole hours for `transcript.rotation.sweepIntervalHours`. An oversized value is
-repaired **to that maximum**, not to the default, and logged at warn: Node coerces a larger
-delay to 1 ms, so accepting it would fire every hook timeout immediately and run the rotation
-sweep about a thousand times a second. The hook transport applies the same cap to a
-caller-supplied timeout, and its timeout log quotes the effective (clamped) limit.
+Values that arm a Node timer are additionally capped at the platform maximum of `2147483647`
+ms. A value whose millisecond form would exceed that maximum is repaired **to the maximum**,
+not to the default, and logged at warn: Node coerces a larger delay to 1 ms, so accepting it
+would fire every hook timeout immediately and run the rotation sweep about a thousand times a
+second. The cap is millisecond-based, so for `transcript.rotation.sweepIntervalHours` the
+boundary is fractional - `2147483647 / 3600000` h, about 596.523235 h - and the repair target
+is that same value: 596.1 h (`2145960000` ms) is accepted silently, while a larger value is
+repaired to `596.5232352777778` h and the rotation setup converts it to exactly `2147483647`
+ms. The hook transport applies the same millisecond cap to a caller-supplied timeout, and its
+timeout log quotes the effective (clamped) limit.
 
 `clawmemBin` has no absolute default: it is resolved once at startup, first hit wins - an explicit
 `clawmemBin` from the config, then `$CLAWMEM_BIN`, then the first **regular executable file** named
@@ -498,6 +504,11 @@ plugin deliberately conforms to, or a trade-off that was reviewed and accepted r
   unbounded over the process lifetime; only `transcripts.close()` on disposal clears it.
 - **`staleness-check` cannot emit `additionalContext`.** ClawMem maps that hook to a null event, so the
   plugin can run it (when `bootstrap.stalenessCheck` is true) but it contributes no context.
+- **The first `agent/pre-step` of a session can wait for the in-flight startup hooks.** The
+  `agent/created` handler starts `session-bootstrap`, `curator-nudge`, and `staleness-check`
+  without awaiting them, and that first step awaits the stored promise so the bootstrap text lands
+  on it; each hook is bounded by its own transport timeout (the 2 s surfacing default), so the wait
+  is at most their sum - 3 × 2 s = 6 s with all three enabled and less as they are disabled.
 - **Session ids are sanitised lossily for names outside the transcript alphabet.** Each session id
   becomes one directory segment by replacing every character outside `[A-Za-z0-9._-]` with `_`
   (an all-dots id becomes one underscore per dot, an empty id becomes `_`), so two distinct foreign
