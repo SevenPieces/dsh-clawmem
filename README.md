@@ -350,16 +350,19 @@ name/size plus the `{"file_path":...}` form when the block exposes a path), a sy
 **assistant** `tool_use` line for a `tool/call` that no assistant message carried
 (de-duplicated by `callId`), and `tool_result` lines (content truncated to
 `transcript.maxToolResultChars`, default 500) whose identical re-delivery for the same
-`tool_use_id` is dropped. That per-session de-duplication memory is a bounded FIFO window
-of the 2,048 most recent result fingerprints, so it cannot grow without bound and a very old
-identical result re-delivered after enough later results may be re-emitted. That bound applies
-to result fingerprints only: the synthesized-`tool_use` de-duplication uses a separate
-per-session set of callIds that is never evicted, because capping it would allow an old callId
-to re-emit a synthesized assistant `tool_use` and weaken the zero-duplicate-`tool_use_id`
-property. It is far lighter than the fingerprint window (one short id per tool call, against
-fingerprints that embed up to 500 characters of result text) but it is not bounded; it is
-dropped only when the manager closes (see Known limitations). Multi-block tool results are emitted in
-full, not just the first block. Excluded: system messages,
+`tool_use_id` is dropped. That de-duplication compares the **full** untruncated result text
+plus `is_error`, stored as a SHA-256 hex digest per result, so a result that differs from an
+earlier one only past the truncation point (or only in `is_error`) is appended rather than
+silently dropped. The per-session de-duplication memory is a bounded FIFO window of the 2,048
+most recent result fingerprints, each a fixed 64-character digest, so it is O(window)
+regardless of result size and a very old identical result re-delivered after enough later
+results may be re-emitted. That bound applies to result fingerprints only: the
+synthesized-`tool_use` de-duplication uses a separate per-session set of callIds that is
+never evicted, because capping it would allow an old callId to re-emit a synthesized
+assistant `tool_use` and weaken the zero-duplicate-`tool_use_id` property. It is far lighter
+than the fingerprint window (one short id per tool call, against 64-character digests) but it
+is not bounded; it is dropped only when the manager closes (see Known limitations).
+Multi-block tool results are emitted in full, not just the first block. Excluded: system messages,
 plugin-injected user messages, reasoning blocks, and empty content lines.
 
 File-handle text comes from a single helper, `fileHandleText` in `lib/transcript.js`, shared by
@@ -421,11 +424,11 @@ At activation the plugin reads `routing-block.dsh.md` and registers it through
 `ctx.systemPrompt.section` as `{name: 'clawmem:routing', order: 300}`; `systemPrompt` is
 declared in the plugin's `inject` list, so the seam is reachable. `routing-block.dsh.md` is
 the DSH adaptation of the upstream ClawMem routing baseline
-`clawmem_option_b_trigger_block.md`; that upstream file is kept outside the repository
-(gitignored as `clawmem_option_b_trigger_block.md`, so it is never in the repository or a
-clone) and deliberately excluded from the npm package, while the adapted
-`routing-block.dsh.md` is tracked in git and shipped in the package. `routingBlock.mode: off`
-disables it, and a missing block file is logged at warn.
+`clawmem_option_b_trigger_block.md`. That upstream baseline is not part of this repository
+or a clone of it (a local copy, if any, is gitignored as
+`clawmem_option_b_trigger_block.md`), and it is not shipped in the npm package, while the
+adapted `routing-block.dsh.md` is tracked in git and shipped in the package.
+`routingBlock.mode: off` disables it, and a missing block file is logged at warn.
 
 `skill.register: true` registers ClawMem's `SKILL.md` as the `clawmem` skill: read once at
 activation from the resolved ClawMem **package** directory - `resolve(dirname(realpathSync(bin)), '..')`
@@ -471,7 +474,7 @@ plugin deliberately conforms to, or a trade-off that was reviewed and accepted r
   synthesized `tool/call` line from re-emitting a callId an assistant message already carried
   (`seenBySession`) is per-session and never evicted. Capping it would allow an old callId to re-emit a
   synthesized assistant `tool_use`, weakening the zero-duplicate-`tool_use_id` property. It is
-  memory-light - one short id per tool call rather than an up-to-500-character result fingerprint - but
+  memory-light - one short id per tool call rather than a 64-character result digest - but
   unbounded over the process lifetime; only `transcripts.close()` on disposal clears it.
 - **`staleness-check` cannot emit `additionalContext`.** ClawMem maps that hook to a null event, so the
   plugin can run it (when `bootstrap.stalenessCheck` is true) but it contributes no context.

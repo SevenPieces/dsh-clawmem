@@ -6,8 +6,10 @@ import {
   writeFileSync,
   readFileSync,
   existsSync,
+  readdirSync,
   rmSync,
   statSync,
+  symlinkSync,
   utimesSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -845,5 +847,310 @@ test('T-ADV-01: rotation keeps an aged foreign dir with a normal file (counted a
     assert.deepEqual(summary, { removed: 0, kept: 1, errors: 0 },
       'a foreign aged directory must be kept and counted, got: ' + JSON.stringify(summary));
     assert.equal(existsSync(join(foreign, 'notes.txt')), true, 'its contents must survive');
+  });
+});
+
+// --- T-ADV2-01: rotation ownership - a directory is removable only when EVERY
+// entry is a known plugin artifact. ADV-01 taught the classifier to recognise
+// memory/ shapes, but the marker checks were presence-only: transcript.jsonl or
+// memory/precompact-state.md authorized deleting the WHOLE session dir, including
+// foreign files beside or inside it, and a DIRECTORY carrying a marker's name was
+// treated as the marker. The rule pinned here: at the session-dir root only a
+// regular transcript.jsonl and a real memory/ directory are ours; inside memory/
+// only a regular precompact-state.md is ours; nothing else may be swept away, and
+// a symlink never stands in for either directory.
+
+const ORIGIN_OLD = new Date('2020-01-01T00:00:00Z');
+
+/** Age every path under target (following symlinks) so no child keeps a fresh mtime. */
+function ageTree(target) {
+  const st = statSync(target);
+  if (st.isDirectory()) {
+    for (const name of readdirSync(target)) ageTree(join(target, name));
+  }
+  utimesSync(target, ORIGIN_OLD, ORIGIN_OLD);
+}
+
+/**
+ * Build one aged session dir (session-x) under <host>/transcripts and return the
+ * manager that sweeps it. The host is a fresh temp dir, so a case may place files
+ * outside the swept base dir (symlink targets). build(sessionDir, host) creates
+ * the shape under test.
+ */
+function agedStoreCase(build) {
+  const host = tmpRoot();
+  const base = join(host, 'transcripts');
+  mkdirSync(base, { recursive: true });
+  const session = join(base, 'session-x');
+  mkdirSync(session, { recursive: true });
+  build(session, host);
+  ageTree(session);
+  const manager = createTranscriptManager({
+    dir: base,
+    rotation: { enabled: true, maxAgeDays: 180, sweepIntervalHours: 24 },
+  });
+  return { host, session, manager };
+}
+
+test('T-ADV2-01 rotation: an aged dir whose only entry is transcript.jsonl is REMOVED', () => {
+  const { host, session, manager } = agedStoreCase((s) => {
+    writeFileSync(join(s, 'transcript.jsonl'), '{"old":true}' + LF);
+  });
+  try {
+    const summary = manager.sweep();
+    assert.deepEqual(summary, { removed: 1, kept: 0, errors: 0 },
+      'a lone regular transcript.jsonl is a plugin artifact, got: ' + JSON.stringify(summary));
+    assert.equal(existsSync(session), false, 'the aged session dir must be gone');
+  } finally {
+    rmSync(host, { recursive: true, force: true });
+  }
+});
+
+test('T-ADV2-01 rotation: an aged dir with transcript.jsonl + an empty memory/ is REMOVED', () => {
+  const { host, session, manager } = agedStoreCase((s) => {
+    writeFileSync(join(s, 'transcript.jsonl'), '{"old":true}' + LF);
+    mkdirSync(join(s, 'memory'));
+  });
+  try {
+    const summary = manager.sweep();
+    assert.deepEqual(summary, { removed: 1, kept: 0, errors: 0 },
+      'both entries are known artifacts, got: ' + JSON.stringify(summary));
+    assert.equal(existsSync(session), false, 'the aged session dir must be gone');
+  } finally {
+    rmSync(host, { recursive: true, force: true });
+  }
+});
+
+test('T-ADV2-01 rotation: an aged dir whose only entry is memory/precompact-state.md is REMOVED', () => {
+  const { host, session, manager } = agedStoreCase((s) => {
+    mkdirSync(join(s, 'memory'));
+    writeFileSync(join(s, 'memory', 'precompact-state.md'), 'state' + LF);
+  });
+  try {
+    const summary = manager.sweep();
+    assert.deepEqual(summary, { removed: 1, kept: 0, errors: 0 },
+      'a lone regular precompact-state.md is a plugin artifact, got: ' + JSON.stringify(summary));
+    assert.equal(existsSync(session), false, 'the aged session dir must be gone');
+  } finally {
+    rmSync(host, { recursive: true, force: true });
+  }
+});
+
+test('T-ADV2-01 rotation: an aged EMPTY dir is REMOVED', () => {
+  const { host, session, manager } = agedStoreCase(() => {});
+  try {
+    const summary = manager.sweep();
+    assert.deepEqual(summary, { removed: 1, kept: 0, errors: 0 },
+      'an empty dir holds no foreign content, got: ' + JSON.stringify(summary));
+    assert.equal(existsSync(session), false, 'the aged empty dir must be gone');
+  } finally {
+    rmSync(host, { recursive: true, force: true });
+  }
+});
+
+test('T-ADV2-01 rotation: an aged dir whose only entry is an empty memory/ is REMOVED', () => {
+  const { host, session, manager } = agedStoreCase((s) => {
+    mkdirSync(join(s, 'memory'));
+  });
+  try {
+    const summary = manager.sweep();
+    assert.deepEqual(summary, { removed: 1, kept: 0, errors: 0 },
+      'the plugin-created empty memory/ is not foreign content, got: ' + JSON.stringify(summary));
+    assert.equal(existsSync(session), false, 'the aged session dir must be gone');
+  } finally {
+    rmSync(host, { recursive: true, force: true });
+  }
+});
+
+test('T-ADV2-01 rotation: an aged dir with transcript.jsonl + foreign.md is KEPT', () => {
+  const { host, session, manager } = agedStoreCase((s) => {
+    writeFileSync(join(s, 'transcript.jsonl'), '{"old":true}' + LF);
+    writeFileSync(join(s, 'foreign.md'), 'user notes beside the transcript' + LF);
+  });
+  try {
+    const summary = manager.sweep();
+    assert.deepEqual(summary, { removed: 0, kept: 1, errors: 0 },
+      'a transcript beside foreign content must not authorize deleting it, got: ' + JSON.stringify(summary));
+    assert.equal(readFileSync(join(session, 'foreign.md'), 'utf8'), 'user notes beside the transcript' + LF,
+      'the foreign file must survive');
+  } finally {
+    rmSync(host, { recursive: true, force: true });
+  }
+});
+
+test('T-ADV2-01 rotation: an aged dir with precompact-state.md + memory/user-notes.md is KEPT', () => {
+  const { host, session, manager } = agedStoreCase((s) => {
+    mkdirSync(join(s, 'memory'));
+    writeFileSync(join(s, 'memory', 'precompact-state.md'), 'state' + LF);
+    writeFileSync(join(s, 'memory', 'user-notes.md'), 'important user content' + LF);
+  });
+  try {
+    const summary = manager.sweep();
+    assert.deepEqual(summary, { removed: 0, kept: 1, errors: 0 },
+      'a marker must not imply ownership of its sibling files, got: ' + JSON.stringify(summary));
+    assert.equal(readFileSync(join(session, 'memory', 'user-notes.md'), 'utf8'), 'important user content' + LF,
+      'the foreign memory file must survive');
+  } finally {
+    rmSync(host, { recursive: true, force: true });
+  }
+});
+
+test('T-ADV2-01 rotation: an aged dir with precompact-state.md + a hidden memory/.keep is KEPT', () => {
+  const { host, session, manager } = agedStoreCase((s) => {
+    mkdirSync(join(s, 'memory'));
+    writeFileSync(join(s, 'memory', 'precompact-state.md'), 'state' + LF);
+    writeFileSync(join(s, 'memory', '.keep'), 'keep me' + LF);
+  });
+  try {
+    const summary = manager.sweep();
+    assert.deepEqual(summary, { removed: 0, kept: 1, errors: 0 },
+      'a hidden sibling is still foreign content, got: ' + JSON.stringify(summary));
+    assert.equal(existsSync(join(session, 'memory', '.keep')), true, 'the hidden file must survive');
+  } finally {
+    rmSync(host, { recursive: true, force: true });
+  }
+});
+
+test('T-ADV2-01 rotation: a DIRECTORY named transcript.jsonl is KEPT', () => {
+  const { host, session, manager } = agedStoreCase((s) => {
+    mkdirSync(join(s, 'transcript.jsonl'));
+  });
+  try {
+    const summary = manager.sweep();
+    assert.deepEqual(summary, { removed: 0, kept: 1, errors: 0 },
+      'a directory is not the transcript marker file, got: ' + JSON.stringify(summary));
+    assert.equal(existsSync(join(session, 'transcript.jsonl')), true, 'the directory must survive');
+    assert.equal(statSync(join(session, 'transcript.jsonl')).isDirectory(), true);
+  } finally {
+    rmSync(host, { recursive: true, force: true });
+  }
+});
+
+test('T-ADV2-01 rotation: a DIRECTORY named memory/precompact-state.md is KEPT', () => {
+  const { host, session, manager } = agedStoreCase((s) => {
+    mkdirSync(join(s, 'memory'));
+    mkdirSync(join(s, 'memory', 'precompact-state.md'));
+  });
+  try {
+    const summary = manager.sweep();
+    assert.deepEqual(summary, { removed: 0, kept: 1, errors: 0 },
+      'a directory is not the precompact-state.md marker file, got: ' + JSON.stringify(summary));
+    assert.equal(existsSync(join(session, 'memory', 'precompact-state.md')), true, 'the directory must survive');
+    assert.equal(statSync(join(session, 'memory', 'precompact-state.md')).isDirectory(), true);
+  } finally {
+    rmSync(host, { recursive: true, force: true });
+  }
+});
+
+test('T-ADV2-01 rotation: a symlink named memory is KEPT, even when its target holds precompact-state.md',
+  { skip: process.platform === 'win32' ? 'directory symlinks need extra privileges on win32' : false }, () => {
+  const { host, session, manager } = agedStoreCase((s, h) => {
+    const outside = join(h, 'outside-memory');
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, 'precompact-state.md'), 'state outside the session' + LF);
+    symlinkSync(outside, join(s, 'memory'), 'dir');
+  });
+  try {
+    const summary = manager.sweep();
+    assert.deepEqual(summary, { removed: 0, kept: 1, errors: 0 },
+      'a symlink is not the plugin-created memory/ directory, got: ' + JSON.stringify(summary));
+    assert.equal(existsSync(join(session, 'memory')), true, 'the symlink must survive');
+    assert.equal(readFileSync(join(session, 'memory', 'precompact-state.md'), 'utf8'),
+      'state outside the session' + LF, 'the symlink target must be untouched');
+  } finally {
+    rmSync(host, { recursive: true, force: true });
+  }
+});
+
+test('T-ADV2-01 rotation: an aged foreign dir with a normal file is KEPT', () => {
+  const { host, session, manager } = agedStoreCase((s) => {
+    writeFileSync(join(s, 'notes.txt'), 'ordinary user file' + LF);
+  });
+  try {
+    const summary = manager.sweep();
+    assert.deepEqual(summary, { removed: 0, kept: 1, errors: 0 },
+      'a foreign aged directory must be kept and counted, got: ' + JSON.stringify(summary));
+    assert.equal(readFileSync(join(session, 'notes.txt'), 'utf8'), 'ordinary user file' + LF,
+      'its contents must survive');
+  } finally {
+    rmSync(host, { recursive: true, force: true });
+  }
+});
+
+test('T-ADV2-01 rotation: a dir whose only entry is a FILE named memory is KEPT', () => {
+  const { host, session, manager } = agedStoreCase((s) => {
+    writeFileSync(join(s, 'memory'), 'a regular file, not the plugin memory dir' + LF);
+  });
+  try {
+    const summary = manager.sweep();
+    assert.deepEqual(summary, { removed: 0, kept: 1, errors: 0 },
+      'a file named memory is not the plugin-created directory, got: ' + JSON.stringify(summary));
+    assert.equal(statSync(join(session, 'memory')).isFile(), true, 'the file must survive');
+  } finally {
+    rmSync(host, { recursive: true, force: true });
+  }
+});
+
+// --- T-ADV2-02: tool-result de-duplication must use the FULL result content,
+// not the post-truncation text. With the default maxToolResultChars 500, two
+// distinct results sharing their first 500 chars collided and the second was
+// silently dropped. The stored line stays truncated at 500 chars; only the
+// de-dupe identity sees the whole result.
+
+test('T-ADV2-02: two results sharing the first 500 chars but differing in the tail are BOTH stored', async () => {
+  await withRoot((root) => {
+    const manager = createTranscriptManager({ dir: root }); // shipped default cap: 500
+    const writer = manager.writerFor('s1');
+    const shared = 'A'.repeat(500);
+
+    writer.appendToolResult({ callId: 'long', content: shared + 'TAIL-ONE', isError: false });
+    writer.appendToolResult({ callId: 'long', content: shared + 'TAIL-TWO', isError: false });
+
+    const lines = readLines(writer.path);
+    assert.equal(lines.length, 2,
+      'the second distinct result must not be dropped because its truncated prefix matches, got: ' +
+        JSON.stringify(lines.map((line) => line.message.content[0].content)));
+    for (const line of lines) {
+      const block = line.message.content[0];
+      assert.equal(block.type, 'tool_result');
+      assert.equal(block.tool_use_id, 'long');
+      assert.equal(block.is_error, false);
+      assert.equal(block.content.length, 500, 'the stored result stays truncated at the 500-char cap');
+      assert.equal(block.content, shared, 'the stored content is the 500-char prefix');
+    }
+  });
+});
+
+test('T-ADV2-02: an identical full re-delivery is still de-duped (one line) after truncation', async () => {
+  await withRoot((root) => {
+    const manager = createTranscriptManager({ dir: root });
+    const writer = manager.writerFor('s1');
+    const long = 'A'.repeat(500) + 'TAIL-ONE';
+
+    writer.appendToolResult({ callId: 'long', content: long, isError: false });
+    writer.appendToolResult({ callId: 'long', content: long, isError: false });
+
+    const lines = readLines(writer.path);
+    assert.equal(lines.length, 1, 'an identical full re-delivery must stay one line, got: ' + lines.length);
+    assert.equal(lines[0].message.content[0].content.length, 500);
+    assert.equal(lines[0].message.content[0].content, 'A'.repeat(500));
+  });
+});
+
+test('T-ADV2-02: the same first 500 chars with a different isError yields two lines', async () => {
+  await withRoot((root) => {
+    const manager = createTranscriptManager({ dir: root });
+    const writer = manager.writerFor('s1');
+    const result = 'A'.repeat(500) + 'TAIL-ONE';
+
+    writer.appendToolResult({ callId: 'long', content: result, isError: false });
+    writer.appendToolResult({ callId: 'long', content: result, isError: true });
+
+    const lines = readLines(writer.path);
+    assert.equal(lines.length, 2, 'a changed is_error is a different result, got: ' + lines.length);
+    assert.deepEqual(
+      lines.map((line) => [line.message.content[0].content, line.message.content[0].is_error]),
+      [['A'.repeat(500), false], ['A'.repeat(500), true]],
+    );
   });
 });
