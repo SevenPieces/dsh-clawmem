@@ -4,7 +4,7 @@ Out-of-tree DSH Cordis bundle that gives ClawMem full parity with its
 Claude Code / OpenClaw / Hermes integrations, plus the companion MCP client row that exposes
 ClawMem's `mcp__clawmem__*` tools.
 
-Tested with DSH 0.1.5-rc.1 and ClawMem 0.24.0.
+Tested with dsh-v0.2.1-rc.2 and ClawMem 0.24.0.
 
 ## Purpose
 
