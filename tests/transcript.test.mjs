@@ -1154,3 +1154,56 @@ test('T-ADV2-02: the same first 500 chars with a different isError yields two li
     );
   });
 });
+
+// --- V3-01: the de-dupe identity must distinguish strings that are distinct as
+// UTF-16 but collide as UTF-8. Node's UTF-8 encoder replaces an unpaired
+// surrogate with U+FFFD, so hashing the full text as UTF-8 made 'A\uD800B' and
+// 'A\uFFFDB' share one fingerprint and silently dropped the second distinct
+// result for the same callId. The identity must live on the UTF-16 code units.
+
+const LONE_SURROGATE = 'A\uD800B';
+const REPLACEMENT_CHAR = 'A\uFFFDB';
+
+test('T-V3-01: two results for one callId that differ only in an unpaired surrogate are BOTH stored', async () => {
+  // Guard the premise: these are distinct JS strings whose UTF-8 encodings are
+  // byte-identical, so a UTF-8-based digest cannot tell them apart. If this
+  // ever stops holding, the test would silently stop exercising the bug.
+  assert.notEqual(LONE_SURROGATE, REPLACEMENT_CHAR, 'the pair must be distinct UTF-16 strings');
+  assert.ok(
+    Buffer.from(LONE_SURROGATE, 'utf8').equals(Buffer.from(REPLACEMENT_CHAR, 'utf8')),
+    'the pair must collide under UTF-8 so this test exercises the surrogate-blind digest',
+  );
+
+  await withRoot((root) => {
+    const manager = createTranscriptManager({ dir: root });
+    const writer = manager.writerFor('s1');
+
+    writer.appendToolResult({ callId: 'surrogate', content: LONE_SURROGATE, isError: false });
+    writer.appendToolResult({ callId: 'surrogate', content: REPLACEMENT_CHAR, isError: false });
+
+    const lines = readLines(writer.path);
+    assert.equal(lines.length, 2,
+      'a result differing only in an unpaired surrogate is a different result, got: ' +
+        JSON.stringify(lines.map((line) => line.message.content[0].content)));
+    assert.deepEqual(
+      lines.map((line) => line.message.content[0].content),
+      [LONE_SURROGATE, REPLACEMENT_CHAR],
+      'both distinct UTF-16 strings must be stored verbatim, in delivery order',
+    );
+  });
+});
+
+test('T-V3-01: an identical unpaired-surrogate re-delivery is still de-duped (one line)', async () => {
+  await withRoot((root) => {
+    const manager = createTranscriptManager({ dir: root });
+    const writer = manager.writerFor('s1');
+
+    writer.appendToolResult({ callId: 'surrogate', content: LONE_SURROGATE, isError: false });
+    writer.appendToolResult({ callId: 'surrogate', content: LONE_SURROGATE, isError: false });
+
+    const lines = readLines(writer.path);
+    assert.equal(lines.length, 1, 'an identical re-delivery must stay one line, got: ' + lines.length);
+    assert.equal(lines[0].message.content[0].content, LONE_SURROGATE);
+    assert.equal(lines[0].message.content[0].is_error, false);
+  });
+});
