@@ -25,7 +25,7 @@
   },
   "engines": {
     "node": ">=22",
-    "dsh": ">=0.2.1"
+    "dsh": ">=0.2.0"
   },
   "license": "MIT",
   "repository": {
