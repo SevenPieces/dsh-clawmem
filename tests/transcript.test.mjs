@@ -7,10 +7,11 @@ import {
   readFileSync,
   existsSync,
   rmSync,
+  statSync,
   utimesSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import { createTranscriptManager } from '../lib/transcript.js';
 // Namespace import (not a named import) so a missing export fails one test
@@ -18,6 +19,7 @@ import { createTranscriptManager } from '../lib/transcript.js';
 import * as transcript from '../lib/transcript.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+const LF = String.fromCharCode(10);
 
 function tmpRoot() {
   return mkdtempSync(join(tmpdir(), 'clawmem-transcript-'));
@@ -602,5 +604,166 @@ test('F3: the default retained window is bounded (2048) on the production path w
     writer.appendToolResult({ callId: 'c0', content: 'payload 0', isError: false });
     writer.appendToolResult({ callId: `c${n - 1}`, content: `payload ${n - 1}`, isError: false });
     assert.equal(readLines(writer.path).length, n + 1);
+  });
+});
+
+// --- T-F5: a fresh DSH_HOME is not a rotation error. ---
+
+test('T-F5: sweep on a not-yet-created transcript dir is silent; an unreadable dir still warns', () => {
+  // (1) The documented normal state before the first transcript write: ENOENT is a
+  // no-op, not a warn (activation runs one sweep before any writer exists).
+  const root = tmpRoot();
+  const missing = join(root, 'not-created-yet');
+  try {
+    const { logger, calls } = makeLogger();
+    const manager = createTranscriptManager({ dir: missing, logger });
+    const summary = manager.sweep();
+    assert.deepEqual(summary, { removed: 0, kept: 0, errors: 0 }, 'a missing dir is not an error');
+    assert.deepEqual(calls.filter((c) => c.level === 'warn' || c.level === 'error'), [],
+      'a missing dir must not warn, got: ' + JSON.stringify(calls));
+    assert.equal(existsSync(missing), false, 'sweep must not create the transcript dir');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+
+  // (2) A path that is a regular file cannot be scanned: ENOTDIR is a real error and
+  // must keep warning (the fix must special-case only ENOENT).
+  const root2 = tmpRoot();
+  const notADir = join(root2, 'not-a-dir');
+  try {
+    writeFileSync(notADir, 'a regular file where the transcript dir should be' + LF);
+    const { logger, calls } = makeLogger();
+    const manager = createTranscriptManager({ dir: notADir, logger });
+    const summary = manager.sweep();
+    assert.equal(summary.errors, 1, 'an unreadable dir is still an error');
+    assert.equal(summary.removed, 0);
+    assert.equal(calls.filter((c) => c.level === 'warn').length, 1, 'the real read failure still warns');
+  } finally {
+    rmSync(root2, { recursive: true, force: true });
+  }
+});
+
+// --- T-F6: transcript data is private to the owner. ---
+
+test('T-F6: with a permissive umask the session dir is 0700 and the transcript file 0600',
+  { skip: process.platform === 'win32' ? 'POSIX mode bits are not available on win32' : false }, () => {
+    const root = tmpRoot();
+    const previousUmask = process.umask(0);
+    try {
+      // umask 0 makes every unset mode bit observable: a default mkdir/append would
+      // create 0777/0666, exposing transcripts to every local user.
+      const manager = createTranscriptManager({ dir: root });
+      manager.writerFor('session-private').appendUser('secret transcript text');
+
+      const dir = join(root, 'session-private');
+      const file = join(dir, 'transcript.jsonl');
+      const dirMode = statSync(dir).mode & 0o777;
+      const fileMode = statSync(file).mode & 0o777;
+      assert.equal(dirMode & 0o077, 0, 'session dir is group/world accessible: 0' + dirMode.toString(8));
+      assert.equal(fileMode & 0o077, 0, 'transcript file is group/world accessible: 0' + fileMode.toString(8));
+      assert.equal(dirMode, 0o700, 'the session dir must be created 0700, got 0' + dirMode.toString(8));
+      assert.equal(fileMode, 0o600, 'the transcript file must be created 0600, got 0' + fileMode.toString(8));
+    } finally {
+      process.umask(previousUmask);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+// --- T-F7: a hostile session id cannot escape the transcript dir. ---
+
+test('T-F7: a hostile session id stays under the configured dir and never becomes "." or ".."',
+  { skip: process.platform === 'win32' ? 'path-separator semantics differ on win32' : false }, async () => {
+    await withRoot((hostRoot) => {
+      // Nest the configured dir so a baseline escape writes inside hostRoot (cleaned
+      // up) instead of next to the system temp dir.
+      const root = join(hostRoot, 'transcripts');
+      mkdirSync(root, { recursive: true });
+      const base = resolve(root);
+      const manager = createTranscriptManager({ dir: root });
+      const pathsOf = (sessionId) => [manager.pathFor(sessionId), manager.writerFor(sessionId).path];
+
+      for (const sessionId of ['../escape', '..', '.']) {
+        for (const path of pathsOf(sessionId)) {
+          const dir = dirname(resolve(path));
+          const rel = relative(base, dir);
+          // Check segments, not a string prefix: a single safe segment named '.._escape'
+          // is contained even though it starts with two dots.
+          assert.ok(rel !== '' && !rel.split(sep).includes('..') && !isAbsolute(rel),
+            JSON.stringify(sessionId) + ' escaped the transcript dir: ' + path);
+          assert.notEqual(basename(dir), '.', JSON.stringify(sessionId) + ' resolved to ".": ' + path);
+          assert.notEqual(basename(dir), '..', JSON.stringify(sessionId) + ' resolved to "..": ' + path);
+        }
+      }
+      // The dot segments must not collapse onto the base dir either.
+      for (const sessionId of ['..', '.']) {
+        for (const path of pathsOf(sessionId)) {
+          assert.equal(dirname(dirname(resolve(path))), base,
+            JSON.stringify(sessionId) + ' must become exactly one safe segment under the base dir, got ' + path);
+        }
+      }
+
+      // A normal id keeps its historical path.
+      assert.equal(manager.pathFor('session-abc'), join(root, 'session-abc', 'transcript.jsonl'));
+      assert.equal(manager.writerFor('session-abc').path, join(root, 'session-abc', 'transcript.jsonl'));
+
+      // An empty id still needs a real segment: the documented safe placeholder is "_".
+      for (const path of pathsOf('')) {
+        assert.equal(resolve(path), join(base, '_', 'transcript.jsonl'),
+          'an empty session id must become the safe "_" segment, got ' + path);
+      }
+    });
+  });
+
+// --- T-F8: rotation containment - remove only real session dirs. ---
+
+test('T-F8: rotation keeps an aged foreign directory, removes aged session and empty dirs', async () => {
+  const age = (path) => {
+    const old = new Date(Date.now() - 200 * DAY_MS);
+    utimesSync(path, old, old);
+  };
+
+  // (1) An aged directory that holds an ordinary file is NOT a transcript session.
+  await withRoot((root) => {
+    const foreign = join(root, 'notes');
+    mkdirSync(foreign, { recursive: true });
+    writeFileSync(join(foreign, 'notes.txt'), 'ordinary user file' + LF);
+    age(foreign);
+    age(join(foreign, 'notes.txt'));
+    const summary = createTranscriptManager({ dir: root }).sweep();
+    assert.equal(summary.removed, 0, 'a foreign aged directory must not be removed');
+    assert.equal(existsSync(join(foreign, 'notes.txt')), true, 'its contents must survive');
+  });
+
+  // (2) An aged session dir with a transcript is still rotated away.
+  await withRoot((root) => {
+    const session = join(root, 'aged-session');
+    mkdirSync(session, { recursive: true });
+    writeFileSync(join(session, 'transcript.jsonl'), '{"old":true}' + LF);
+    age(session);
+    age(join(session, 'transcript.jsonl'));
+    const summary = createTranscriptManager({ dir: root }).sweep();
+    assert.equal(summary.removed, 1, 'an aged session dir must be removed');
+    assert.equal(existsSync(session), false);
+  });
+
+  // (3) An aged EMPTY dir is a session dir that never got its first line: removable.
+  await withRoot((root) => {
+    const empty = join(root, 'aged-empty');
+    mkdirSync(empty, { recursive: true });
+    age(empty);
+    const summary = createTranscriptManager({ dir: root }).sweep();
+    assert.equal(summary.removed, 1, 'an aged empty dir must be removed');
+    assert.equal(existsSync(empty), false);
+  });
+
+  // (4) A fresh session dir is kept.
+  await withRoot((root) => {
+    const fresh = join(root, 'fresh-session');
+    mkdirSync(fresh, { recursive: true });
+    writeFileSync(join(fresh, 'transcript.jsonl'), '{"fresh":true}' + LF);
+    const summary = createTranscriptManager({ dir: root }).sweep();
+    assert.equal(summary.removed, 0, 'a fresh session dir must be kept');
+    assert.equal(existsSync(fresh), true);
+    assert.equal(summary.kept, 1);
   });
 });

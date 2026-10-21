@@ -135,14 +135,22 @@ test('a multi-block tool result emits every block, joined (L5)', () => {
   const { ctx, handlers } = makeCtx()
   apply(ctx, { clawmemBin: env.bin, transcript: { dir: env.root, rotation: { enabled: false } } })
   const session = { id: 'sess-tool', header: {} }
+  // Live session-format-v4 ToolResultMessage: toolCallId/isError live at MESSAGE level
+  // and the content is a flat ContentBlock[]. The retired nested {type:'tool-result'}
+  // wrapper this test used to model is refused by v4's retired-syntax check.
   handlers.get('session/event')[0].fn(session, {
     type: 'tool/result',
     data: {
+      turn: 1,
+      step: 1,
       message: {
+        role: 'tool',
+        toolCallId: 'call-9',
+        isError: true,
         content: [
-          { type: 'tool-result', toolCallId: undefined, content: [{ type: 'text', text: 'first block' }] },
-          { type: 'tool-result', toolCallId: 'call-9', content: [{ type: 'text', text: 'second block' }] },
-          { type: 'tool-result', toolCallId: undefined, content: [{ type: 'text', text: 'third block' }], isError: true },
+          { type: 'text', text: 'first block' },
+          { type: 'text', text: 'second block' },
+          { type: 'text', text: 'third block' },
         ],
       },
     },
@@ -150,9 +158,9 @@ test('a multi-block tool result emits every block, joined (L5)', () => {
   const lines = readFileSync(join(env.root, 'sess-tool', 'transcript.jsonl'), 'utf8').trim().split(LF).map((l) => JSON.parse(l))
   assert.equal(lines.length, 1)
   const block = lines[0].message.content[0]
-  assert.equal(block.tool_use_id, 'call-9', 'toolCallId comes from the first block that has one')
+  assert.equal(block.tool_use_id, 'call-9', 'the message-level toolCallId reaches tool_use_id')
   assert.equal(block.content, ['first block', 'second block', 'third block'].join(LF))
-  assert.equal(block.is_error, true, 'any error block marks the result as an error')
+  assert.equal(block.is_error, true, 'the message-level isError reaches is_error')
   rmSync(env.root, { recursive: true, force: true })
 })
 
@@ -261,14 +269,17 @@ const TOOL_FILE_BLOCK = {
 }
 const TOOL_IMAGE_BLOCK = { type: 'image', attachment: { attachmentId: 'sha256:zz', name: 'shot.png', bytes: 9 } }
 
-function emitToolResult(handlers, session, innerBlocks) {
+function emitToolResult(handlers, session, blocks) {
+  // Live session-format-v4 ToolResultMessage: the id/flag live on the message and the
+  // content is a flat ContentBlock[] (the retired {type:'tool-result'} wrapper this
+  // helper used to model is refused by v4's retired-syntax check).
   handlers.get('session/event')[0].fn(session, {
     type: 'tool/result',
-    data: { message: { content: [{ type: 'tool-result', toolCallId: 'call-inner', content: innerBlocks }] } },
+    data: { turn: 1, step: 1, message: { role: 'tool', toolCallId: 'call-inner', isError: false, content: blocks } },
   })
 }
 
-test('F-3: a file-only inner tool-result block keeps its name and byte size', () => {
+test('F-3: a file-only live tool-result block keeps its name and byte size', () => {
   const env = setup()
   const { ctx, handlers } = makeCtx()
   apply(ctx, { clawmemBin: env.bin, transcript: { dir: env.root, rotation: { enabled: false } } })
@@ -280,7 +291,7 @@ test('F-3: a file-only inner tool-result block keeps its name and byte size', ()
   rmSync(env.root, { recursive: true, force: true })
 })
 
-test('F-3: an image-only inner tool-result block contributes the [image] placeholder', () => {
+test('F-3: an image-only live tool-result block contributes the [image] placeholder', () => {
   const env = setup()
   const { ctx, handlers } = makeCtx()
   apply(ctx, { clawmemBin: env.bin, transcript: { dir: env.root, rotation: { enabled: false } } })
@@ -290,7 +301,7 @@ test('F-3: an image-only inner tool-result block contributes the [image] placeho
   rmSync(env.root, { recursive: true, force: true })
 })
 
-test('F-3: a mixed inner tool result still concatenates every block in order', () => {
+test('F-3: a mixed live tool result still concatenates every block in order', () => {
   const env = setup()
   const { ctx, handlers } = makeCtx()
   apply(ctx, { clawmemBin: env.bin, transcript: { dir: env.root, rotation: { enabled: false } } })
@@ -325,7 +336,7 @@ test('F-3 guard: the direct prompt-text path is unchanged for image/file blocks'
   rmSync(env.root, { recursive: true, force: true })
 })
 
-test('F-3 guard: a tool-result NESTED image/file block is not prompt text either', async () => {
+test('F-3 guard: a live tool-result file block is not prompt text either', async () => {
   // The prompt-text traversal must not pick up the tool-result-only mapping.
   // TOOL_FILE_BLOCK's handle text is longer than surfacing.minPromptChars (20),
   // so a leak here would spawn context-surfacing where the pre-fix code did not.
@@ -333,8 +344,8 @@ test('F-3 guard: a tool-result NESTED image/file block is not prompt text either
   const { ctx, handlers } = makeCtx()
   apply(ctx, { clawmemBin: env.bin, transcript: { dir: env.root, rotation: { enabled: false } } })
   const payload = {
-    agent: { session: { id: 'sess-prompt-nested', header: {} } },
-    messages: [{ content: [{ type: 'tool-result', toolCallId: 'call_nested', content: [TOOL_FILE_BLOCK] }] }],
+    agent: { session: { id: 'sess-prompt-tool', header: {} } },
+    messages: [{ role: 'tool', toolCallId: 'call_live', content: [TOOL_FILE_BLOCK] }],
     turn: 1,
     step: 1,
   }

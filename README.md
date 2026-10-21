@@ -31,18 +31,18 @@ only DSH module import (`createUserMessage` from `@deepseek-ai/dsh-llm`) is load
 
 ## Install
 
-From npm - the published package contains `lib/`, `cordis.patch.yml`, `routing-block.dsh.md`,
-`README.md` and `LICENSE` (tests are not shipped):
-
-```bash
-dsh plugin --profile web add dsh-clawmem
-```
-
-From a local checkout (the form used during development):
+There is no published npm package yet: `npm view dsh-clawmem` returns 404, so adding the bare
+name `dsh-clawmem` cannot resolve a registry copy. The working install today is the local
+checkout (also the form used during development):
 
 ```bash
 dsh plugin --profile web add "$HOME/.dsh/plugins/dsh-clawmem"
 ```
+
+The package manifest already lists the files that would ship: `lib/`, `cordis.patch.yml`,
+`routing-block.dsh.md`, `README.md` and `LICENSE` (tests are not shipped; see `files` in
+`package.json`). Once the package is published, `dsh plugin --profile web add dsh-clawmem`
+becomes the registry install path.
 
 The CLI reconciles a `dsh.bundle` dependency into `dsh.profile.bundles` using the bundle patch
 declared in `package.json` (`dsh.bundle.patch: ./cordis.patch.yml`). Restart `dsh-web.service`
@@ -97,7 +97,7 @@ cd "$HOME/.dsh/plugins/dsh-clawmem" && node --test tests/*.test.mjs
 ```
 
 The runner prints the authoritative count on its `ℹ tests` line - read that line rather than
-trusting a number in prose (the suite targets Node 22 or newer). There is no CI wiring, so run this one-liner after any change. `tests/` is intentionally **not** part of the published
+trusting a number in prose (the suite targets Node 22 or newer). There is no CI wiring, so run this one-liner after any change. `tests/` is intentionally **not** part of the
 package (see `files` in `package.json`), so this command and the `npm test` script are for a source
 checkout; an installed copy carries no tests to run. `lib/index.js` also exports two internal seams -
 `unavailableClient` and `createHookClient` - used by the fallback path and its tests; they are not a
@@ -246,6 +246,12 @@ leaves the call-site line at warn, so a failure can never be invisible):
   (informational: a consumer keying only on `ok` would read
   unparseable output as a success, while the plugin reads no context from it and never reports it
   as a hook failure).
+
+The non-zero-exit preview is the child's own stderr, escaped to one line (CR and LF become the
+two-character forms `\r` and `\n`, so child output cannot forge log lines) and capped at 500
+characters. It may therefore contain child-rendered text, including user content the child echoed;
+set `logging.logHookStderr: false` to keep that preview out of the log entirely (stderr is still
+captured on the result).
 
 Severity is deliberately asymmetric in the transport: a timeout, a non-zero exit, a spawn/child `error` and a stdin failure are logged
 at **error**, while oversized stdout, a capped stderr, invalid JSON and empty stdout are logged
@@ -409,11 +415,13 @@ role rather than remapping tool results to make one section of one file read bet
 
 ## Routing block and skill
 
-At activation the plugin reads `routing-block.dsh.md` (the DSH adaptation of an upstream
-baseline kept locally and deliberately excluded from both the npm package and the repository)
-and registers it through
+At activation the plugin reads `routing-block.dsh.md` and registers it through
 `ctx.systemPrompt.section` as `{name: 'clawmem:routing', order: 300}`; `systemPrompt` is
-declared in the plugin's `inject` list, so the seam is reachable. `routingBlock.mode: off`
+declared in the plugin's `inject` list, so the seam is reachable. `routing-block.dsh.md` is
+the DSH adaptation of the upstream ClawMem routing baseline
+`clawmem_option_b_trigger_block.md`; that upstream file is kept locally and deliberately
+excluded from both the npm package and the repository (see `.gitignore`), while the adapted
+`routing-block.dsh.md` is tracked in git and shipped in the package. `routingBlock.mode: off`
 disables it, and a missing block file is logged at warn.
 
 `skill.register: true` registers ClawMem's `SKILL.md` as the `clawmem` skill: read once at

@@ -167,6 +167,50 @@ test('logStderr controls whether captured stderr appears in the exit log', async
   cleanup(dir)
 })
 
+test('T-F9: a multiline stderr preview is escaped onto the one log line and stays bounded', async () => {
+  const dir = makeDir()
+  try {
+    // The hook writes a multiline diagnostic (with CR and LF) and fails. The captured
+    // stderr is one log message, so a raw newline would forge extra log lines.
+    const multiline = writeBin(dir, 'multiline.mjs', [
+      'process.stderr.write("line1\\nline2\\rX")',
+      'process.exit(1)'
+    ])
+    const rec = recordingLogger()
+    const r = await createClawmemClient({ bin: multiline, logger: rec.logger }).runHook('context-surfacing', { session_id: 'sess-preview' })
+    assert.equal(r.code, 1)
+    assert.equal(rec.calls.length, 1, 'one exit log line: ' + JSON.stringify(rec.calls))
+    const message = rec.calls[0].message
+    assert.equal(message.includes(String.fromCharCode(10)), false,
+      'the preview must not put a raw LF into the log line: ' + JSON.stringify(message))
+    assert.equal(message.includes(String.fromCharCode(13)), false,
+      'the preview must not put a raw CR into the log line: ' + JSON.stringify(message))
+    assert.ok(message.includes('line1' + String.fromCharCode(92) + 'nline2' + String.fromCharCode(92) + 'rX'),
+      'the preview must carry the escaped forms: ' + JSON.stringify(message))
+
+    // The preview keeps its 500-character bound (it used to be sliced unbounded once
+    // escaping was introduced).
+    const long = writeBin(dir, 'long-stderr.mjs', [
+      'process.stderr.write("Z".repeat(800))',
+      'process.exit(1)'
+    ])
+    const recLong = recordingLogger()
+    await createClawmemClient({ bin: long, logger: recLong.logger }).runHook('context-surfacing', { session_id: 'sess-preview-long' })
+    const previewChars = (recLong.calls[0].message.match(/Z/g) || []).length
+    assert.ok(previewChars > 0 && previewChars <= 500,
+      'the stderr preview must stay bounded at 500 chars, saw ' + previewChars)
+
+    // logging.logHookStderr=false still omits the preview entirely.
+    const recOff = recordingLogger()
+    await createClawmemClient({ bin: multiline, logger: recOff.logger, logStderr: false }).runHook('context-surfacing', { session_id: 'sess-preview-off' })
+    assert.equal(recOff.calls.length, 1)
+    assert.equal(recOff.calls[0].message.includes('line1'), false,
+      'logHookStderr=false must omit the preview: ' + JSON.stringify(recOff.calls[0].message))
+  } finally {
+    cleanup(dir)
+  }
+})
+
 test('a timeout logs exactly once with hook name, session id and elapsed duration', async () => {
   const dir = makeDir()
   const bin = writeBin(dir, 'hang.mjs', HANG_BIN)

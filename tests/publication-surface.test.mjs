@@ -4,10 +4,12 @@
 // A real home path reached a git-tracked test in an earlier batch and survived several scans,
 // because nothing inspected file CONTENT for machine identity. This guard closes that class, and it
 // does so against the REAL publication surface rather than a hand-written model of it:
-//   - every file the walk can reach is scanned, in its NAME and in its BYTES. The walk skips only
-//     .git (measured: the real npm never packs it) and the two exact private documents. It
-//     deliberately does NOT skip *.tgz, *.log or node_modules: measured against npm 11, all three DO
-//     ship when they sit under an allowed "files" entry (they used to be skipped - NEW-2);
+//   - every file the walk can reach is scanned, in its NAME and in its BYTES. The walk skips .git
+//     as an entry of ANY type (in a linked worktree it is a pointer FILE; measured: the real npm
+//     never packs it), every symlink (measured: npm packs neither a link to a file nor a link to a
+//     directory), and the two exact private documents. It deliberately does NOT skip *.tgz, *.log
+//     or node_modules: measured against npm 11, all three DO ship when they sit under an allowed
+//     "files" entry (they used to be skipped - NEW-2);
 //   - a second test asks npm itself ("npm pack --dry-run --json") for the real file list and requires
 //     it to be a SUBSET of the scanned set, to be exactly the reviewed list, and to be free of
 //     .tgz / .log / node_modules / a second YAML file, so the model cannot drift from the tool;
@@ -31,7 +33,7 @@
 //     fails loudly unless the operator accepts the loss through an explicit environment variable.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { homedir, hostname, tmpdir } from 'node:os'
 import { basename, dirname, join, relative, resolve } from 'node:path'
@@ -47,11 +49,12 @@ const NOT_DISTRIBUTED = new Set(['DECISIONS.md', 'clawmem_option_b_trigger_block
  */
 const SYNTHETIC_HOME = new Set(['u', 'someone', 'nobody'])
 /**
- * VCS metadata is the ONLY directory the real npm never packs (measured). Every other directory -
- * including a nested node_modules, or one whose name ends in .tgz - is packed when it sits under an
- * allowed "files" entry, so the walk must descend into it.
+ * VCS metadata is never packed, whatever its ENTRY TYPE: in a normal checkout .git is a directory,
+ * in a linked worktree it is a FILE holding "gitdir: <absolute path>", and npm ships neither. Every
+ * other real directory - including a nested node_modules, or one whose name ends in .tgz - is packed
+ * when it sits under an allowed "files" entry, so the walk must descend into it.
  */
-const NEVER_PACKED_DIRS = new Set(['.git'])
+const NEVER_PACKED_NAMES = new Set(['.git'])
 /**
  * Foreign home spellings, assembled at run time on purpose: a literal foreign home path in this
  * file would be a real hit and the guard would (correctly) flag itself.
@@ -108,13 +111,23 @@ function shippedFiles(root, dir, acc) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     const full = join(dir, entry.name)
     const rel = relative(root, full)
+    // VCS metadata is skipped by NAME, whatever the entry type: a linked worktree stores .git as a
+    // FILE whose bytes are "gitdir: <absolute home path>", so reading it would report the developer's
+    // own identity (T-F4a). A nested .git entry is metadata too.
+    if (NEVER_PACKED_NAMES.has(entry.name)) continue
+    // npm packs no symlink at all (measured: neither a link to a file nor a link to a directory is in
+    // npm pack --dry-run), so a link is not publication content. Do not descend into a linked
+    // directory (its target can be anywhere) and do not read a link (a link to a directory is EISDIR).
+    if (entry.isSymbolicLink()) continue
     if (entry.isDirectory()) {
-      if (NEVER_PACKED_DIRS.has(entry.name)) continue
-      // A directory is ALWAYS walked: skipping by name would let a directory called scratch.tgz
+      // A real directory is ALWAYS walked: skipping by name would let a directory called scratch.tgz
       // (or one named after an ignored file) hide its whole subtree.
       shippedFiles(root, full, acc)
       continue
     }
+    // Only regular files can be read, and only regular files are packed: a FIFO, socket or device is
+    // never publication content, and reading one is not safe.
+    if (!entry.isFile()) continue
     if (NOT_DISTRIBUTED.has(rel)) continue
     acc.push(full)
   }
@@ -242,6 +255,54 @@ function allowlisted(files, rel) {
 // ------------------------------------------------------------------ the shipped tree
 
 test('no file the publication walk reaches carries this machine\'s identity - in its name or its bytes', () => {
+  assert.deepEqual(identityOffenders(ROOT, HOST), [], 'machine identity in a reachable file')
+})
+
+// T-F4: the walk must model what npm actually packs. Two entry kinds it used to
+// mishandle are exercised as controls, and the real-tree consequence is pinned:
+//   (a) a linked worktree stores .git as a POINTER FILE ("gitdir: <home>/..."), not a
+//       directory, so scanning it flags the developer's own home path;
+//   (b) a symlink is neither a directory nor a readable regular file - npm does not
+//       pack symlinks (verified: a symlink to a file and to a dir are both absent
+//       from npm pack --dry-run), so it must be skipped, not read (EISDIR);
+//   (c) the real scan of THIS worktree must therefore be clean.
+// Skipping those entry kinds must not weaken the guard: a REGULAR file is still
+// scanned, and (b) asserts that directly beside the link it ignores.
+
+test('T-F4 (a): a .git pointer file in a linked worktree is not publication content', () => {
+  let offenders
+  assert.doesNotThrow(() => {
+    offenders = withLab((lab) => writeFileSync(join(lab, '.git'), 'gitdir: ' + HOME + '/x' + String.fromCharCode(10)))
+  }, 'the walk must not treat a .git pointer file as publication content')
+  assert.deepEqual(offenders, [], 'the .git pointer file names the home directory but is never packed')
+})
+
+test('T-F4 (b): an untracked symlinked directory is neither walked nor reported', () => {
+  const outside = mkdtempSync(join(tmpdir(), 'dsh-pub-symlink-'))
+  try {
+    // Identity inside the link's target is deliberately planted: npm does not pack the
+    // symlink, so neither the link nor its target is part of the publication surface.
+    writeFileSync(join(outside, 'leak.md'), 'const p = ' + JSON.stringify(HOME) + ';' + String.fromCharCode(10))
+    let offenders
+    assert.doesNotThrow(() => {
+      offenders = withLab((lab) => {
+        symlinkSync(outside, join(lab, 'linked-dir'), 'dir')
+        // The guard must stay strong: a regular file planted beside the link is publication content
+        // and must still be reported, while the symlink and its identity-bearing target are not.
+        writeFileSync(join(lab, 'regular-leak.md'), 'const p = ' + JSON.stringify(HOME) + ';' + String.fromCharCode(10))
+      })
+    }, 'a symlinked directory must not crash the publication walk (EISDIR)')
+    assert.deepEqual(offenders, ['regular-leak.md: the content carries the home directory'],
+      'the regular neighbour is reported while the symlink and its identity-bearing target are not')
+  } finally {
+    rmSync(outside, { recursive: true, force: true })
+  }
+})
+
+test('T-F4 (c): the real ROOT scan is clean in this linked worktree', () => {
+  // In a linked worktree .git is a 69-byte FILE whose content points at this
+  // machine's gitdir; pre-fix the walk read it as a publication file and reported
+  // the home directory inside it.
   assert.deepEqual(identityOffenders(ROOT, HOST), [], 'machine identity in a reachable file')
 })
 
