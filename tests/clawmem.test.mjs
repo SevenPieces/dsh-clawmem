@@ -655,3 +655,38 @@ test('L6c: a timeout reaps a double-forked grandchild and closes both stdio pipe
   }
 })
 
+// --- T-ADV-02: a session id cannot forge a log line. ---
+// lib/clawmem.js builds `where` from the hook name and the session id and appends
+// it to every spawn/timeout/exit message. The plugin's stderr exporter puts one
+// message on one physical stderr line, so a CR/LF carried by the id must be
+// escaped before it reaches the logger or it forges a second line.
+test('T-ADV-02: a session id carrying CR/LF cannot forge a log line', async () => {
+  const dir = makeDir()
+  try {
+    const bin = writeBin(dir, 'fail.mjs', FAIL_BIN)
+    const ESC_LF = String.fromCharCode(92) + 'n'
+    const ESC_CR = String.fromCharCode(92) + 'r'
+    const cases = [
+      { name: 'LF', id: 'evil' + LF + '[clawmem][error] forged-line', escaped: 'evil' + ESC_LF + '[clawmem][error] forged-line' },
+      { name: 'CR', id: 'evil' + String.fromCharCode(13) + '[clawmem][error] forged-line', escaped: 'evil' + ESC_CR + '[clawmem][error] forged-line' },
+    ]
+    for (const c of cases) {
+      const rec = recordingLogger()
+      const r = await createClawmemClient({ bin: bin, logger: rec.logger })
+        .runHook('context-surfacing', { session_id: c.id })
+      assert.equal(r.ok, false, c.name + ': the fake hook fails')
+      assert.equal(rec.calls.length, 1,
+        c.name + ': one hook run must produce exactly one log message, got: ' + JSON.stringify(rec.calls))
+      const message = rec.calls[0].message
+      assert.equal(message.includes(LF), false,
+        c.name + ': a session id must not put a raw LF into the log message: ' + JSON.stringify(message))
+      assert.equal(message.includes(String.fromCharCode(13)), false,
+        c.name + ': a session id must not put a raw CR into the log message: ' + JSON.stringify(message))
+      assert.ok(message.includes(c.escaped),
+        c.name + ': the session id must carry its escaped form, got: ' + JSON.stringify(message))
+    }
+  } finally {
+    cleanup(dir)
+  }
+})
+

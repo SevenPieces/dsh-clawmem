@@ -767,3 +767,83 @@ test('T-F8: rotation keeps an aged foreign directory, removes aged session and e
     assert.equal(summary.kept, 1);
   });
 });
+
+// --- T-ADV-01: rotation must still reap a plugin-created session dir. ---
+// runPrecompact creates <dir>/<id>/memory before the precompact hook runs, so a
+// session that never wrote a transcript line can legitimately leave only an empty
+// memory/ (hook failed/timed out) or only memory/precompact-state.md. The F-8
+// "this is one of our session stores" test must recognise those shapes and rotate
+// them like an empty directory; a memory/ that holds anything else is user data
+// and keeps the whole directory.
+
+function agePath(target) {
+  const old = new Date(Date.now() - 200 * DAY_MS);
+  utimesSync(target, old, old);
+}
+
+test('T-ADV-01: rotation removes an aged session dir whose only entry is an empty memory/', async () => {
+  await withRoot((root) => {
+    const session = join(root, 'session-1');
+    mkdirSync(join(session, 'memory'), { recursive: true });
+    agePath(join(session, 'memory'));
+    agePath(session);
+
+    const summary = createTranscriptManager({ dir: root }).sweep();
+
+    assert.deepEqual(summary, { removed: 1, kept: 0, errors: 0 },
+      'a session dir holding only the plugin-created empty memory/ must be removed, got: ' + JSON.stringify(summary));
+    assert.equal(existsSync(session), false, 'the aged session dir, not just its memory/, must be gone');
+  });
+});
+
+test('T-ADV-01: rotation removes an aged session dir whose only entry is memory/precompact-state.md', async () => {
+  await withRoot((root) => {
+    const session = join(root, 'session-2');
+    const memory = join(session, 'memory');
+    mkdirSync(memory, { recursive: true });
+    writeFileSync(join(memory, 'precompact-state.md'), 'state' + LF);
+    agePath(join(memory, 'precompact-state.md'));
+    agePath(memory);
+    agePath(session);
+
+    const summary = createTranscriptManager({ dir: root }).sweep();
+
+    assert.deepEqual(summary, { removed: 1, kept: 0, errors: 0 },
+      'a precompact-state.md-only session dir must be removed, got: ' + JSON.stringify(summary));
+    assert.equal(existsSync(session), false, 'the aged session dir must be gone');
+  });
+});
+
+test('T-ADV-01: rotation keeps an aged session dir whose memory/ holds another file', async () => {
+  await withRoot((root) => {
+    const session = join(root, 'session-3');
+    const memory = join(session, 'memory');
+    mkdirSync(memory, { recursive: true });
+    writeFileSync(join(memory, 'notes.txt'), 'not ours' + LF);
+    agePath(join(memory, 'notes.txt'));
+    agePath(memory);
+    agePath(session);
+
+    const summary = createTranscriptManager({ dir: root }).sweep();
+
+    assert.deepEqual(summary, { removed: 0, kept: 1, errors: 0 },
+      'a session dir whose memory/ holds foreign content must be kept, got: ' + JSON.stringify(summary));
+    assert.equal(existsSync(join(memory, 'notes.txt')), true, 'the foreign file must survive');
+  });
+});
+
+test('T-ADV-01: rotation keeps an aged foreign dir with a normal file (counted as kept)', async () => {
+  await withRoot((root) => {
+    const foreign = join(root, 'notes');
+    mkdirSync(foreign, { recursive: true });
+    writeFileSync(join(foreign, 'notes.txt'), 'ordinary user file' + LF);
+    agePath(join(foreign, 'notes.txt'));
+    agePath(foreign);
+
+    const summary = createTranscriptManager({ dir: root }).sweep();
+
+    assert.deepEqual(summary, { removed: 0, kept: 1, errors: 0 },
+      'a foreign aged directory must be kept and counted, got: ' + JSON.stringify(summary));
+    assert.equal(existsSync(join(foreign, 'notes.txt')), true, 'its contents must survive');
+  });
+});

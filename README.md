@@ -39,9 +39,9 @@ checkout (also the form used during development):
 dsh plugin --profile web add "$HOME/.dsh/plugins/dsh-clawmem"
 ```
 
-The package manifest already lists the files that would ship: `lib/`, `cordis.patch.yml`,
-`routing-block.dsh.md`, `README.md` and `LICENSE` (tests are not shipped; see `files` in
-`package.json`). Once the package is published, `dsh plugin --profile web add dsh-clawmem`
+The package's `files` allowlist (`package.json`) ships `lib/`, `routing-block.dsh.md`,
+`cordis.patch.yml` and `README.md`; npm adds `package.json` and `LICENSE` automatically, and
+`tests/` is not shipped. Once the package is published, `dsh plugin --profile web add dsh-clawmem`
 becomes the registry install path.
 
 The CLI reconciles a `dsh.bundle` dependency into `dsh.profile.bundles` using the bundle patch
@@ -290,9 +290,11 @@ the `dsh-web.service` unit sends to the systemd journal. The sink is filtered by
 - `warn` (default) - warn and error;
 - `debug` - error, warn, info and debug.
 
-Each mirrored message is written as `[clawmem][<type>] <text>` and truncated to 4,000 characters
-(the `STDERR_MAX_CHARS` constant and the truncation step in `createStderrExporter`'s `export()`,
-both in `lib/index.js`). Registration is an ordinary disposable (the `ctx.logger.exporter(...)` call
+Each mirrored message is written as one physical line, `[clawmem][<type>] <text>`, with CR and
+LF in the rendered text escaped to the two-character forms `\r` and `\n`; the rendered text is
+then truncated to 4,000 characters (the `STDERR_MAX_CHARS` constant and the truncation step in
+`createStderrExporter`'s `export()`, both in `lib/index.js`), so a field such as an untrusted
+session id can never forge a second journald line. Registration is an ordinary disposable (the `ctx.logger.exporter(...)` call
 inside `installLogExporter` in `lib/index.js`), so the exporter is removed on unload, and an absent,
 hostile or throwing `exporter()` API, or a broken `process.stderr`, can neither break activation nor
 a run (fail-open).
@@ -419,8 +421,9 @@ At activation the plugin reads `routing-block.dsh.md` and registers it through
 `ctx.systemPrompt.section` as `{name: 'clawmem:routing', order: 300}`; `systemPrompt` is
 declared in the plugin's `inject` list, so the seam is reachable. `routing-block.dsh.md` is
 the DSH adaptation of the upstream ClawMem routing baseline
-`clawmem_option_b_trigger_block.md`; that upstream file is kept locally and deliberately
-excluded from both the npm package and the repository (see `.gitignore`), while the adapted
+`clawmem_option_b_trigger_block.md`; that upstream file is kept outside the repository
+(gitignored as `clawmem_option_b_trigger_block.md`, so it is never in the repository or a
+clone) and deliberately excluded from the npm package, while the adapted
 `routing-block.dsh.md` is tracked in git and shipped in the package. `routingBlock.mode: off`
 disables it, and a missing block file is logged at warn.
 

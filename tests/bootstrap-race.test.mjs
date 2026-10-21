@@ -154,3 +154,91 @@ test('T-F2 control: with every bootstrap flag false nothing is injected and no h
     rmSync(env.root, { recursive: true, force: true })
   }
 })
+
+// --- T-ADV-03: agent/created is not idempotent. ---
+// The host may deliver the creation event twice (a non-conforming/older host, or
+// a duplicate delivery). Each delivery ran the bootstrap hooks and wrote
+// state.bootstrap / state.bootstrapPromise last-writer-wins, so the hooks were
+// spawned twice and the bootstrap was either duplicated across two steps or lost
+// (nondeterministic). A second creation for a session whose bootstrap is pending
+// or already delivered must be a no-op.
+//
+// The marker file makes exactly ONE session-bootstrap child take the slow path
+// (the first to create it), so the second delivery finishes first - the exact
+// race from the adversary probe.
+function setupDoubleCreate() {
+  const root = mkdtempSync(join(tmpdir(), 'clawmem-double-created-'))
+  const pkg = join(root, 'pkg')
+  const binDir = join(pkg, 'bin')
+  mkdirSync(binDir, { recursive: true })
+  const bin = join(binDir, 'slow-first-clawmem.mjs')
+  const logPath = join(root, 'hooks.log')
+  const stampPath = join(root, 'first-bootstrap.stamp')
+  writeFileSync(bin, [
+    '#!/usr/bin/env node',
+    "import { appendFileSync, writeFileSync } from 'node:fs'",
+    'const hook = process.argv[3]',
+    'const log = process.env.DSH_TEST_LOG',
+    'if (log) appendFileSync(log, hook + String.fromCharCode(10))',
+    'let first = false',
+    "if (hook === 'session-bootstrap') {",
+    '  try {',
+    "    writeFileSync(process.env.DSH_TEST_STAMP, 'x', { flag: 'wx' })",
+    '    first = true',
+    '  } catch { first = false }',
+    '}',
+    "if (hook === 'session-bootstrap') {",
+    '  setTimeout(function () {',
+    "    const text = first ? '<vault-session>BOOTSTRAP-FIRST</vault-session>' : '<vault-session>BOOTSTRAP-SECOND</vault-session>'",
+    "    process.stdout.write(JSON.stringify({ continue: true, hookSpecificOutput: { additionalContext: text } }))",
+    '  }, first ? ' + BOOTSTRAP_DELAY_MS + ' : 0)',
+    '} else {',
+    "  process.stdout.write(JSON.stringify({ continue: true, hookSpecificOutput: { additionalContext: 'CTX-' + hook } }))",
+    '}',
+    '',
+  ].join(LF))
+  chmodSync(bin, 0o755)
+  writeFileSync(join(pkg, 'SKILL.md'), '---' + LF + 'name: clawmem' + LF + 'description: "ClawMem ops"' + LF + '---' + LF + 'body' + LF)
+  process.env.DSH_TEST_LOG = logPath
+  process.env.DSH_TEST_STAMP = stampPath
+  return { root, bin, logPath }
+}
+
+const BOOTSTRAP_HOOKS = ['session-bootstrap', 'curator-nudge', 'staleness-check']
+
+function countOf(text, needle) {
+  return text.split(needle).length - 1
+}
+
+test('T-ADV-03: a duplicated agent/created spawns the bootstrap hooks once and injects the bootstrap once', async () => {
+  const env = setupDoubleCreate()
+  try {
+    const { ctx, handlers } = makeCtx()
+    const dispose = applyForRace(ctx, env.bin, env.root, {})
+    const session = { id: 'sess-double-created', header: {} }
+    const created = handlers.get('agent/created')[0].fn
+    // Two deliveries of the same creation, back to back, before any pre-step: the
+    // first session-bootstrap is still in flight when the (fast) second lands.
+    created({ agent: { session }, source: 'startup' })
+    created({ agent: { session }, source: 'startup' })
+
+    const first = await preStep(handlers, session, 1)
+    assert.equal(countOf(injectedText(first), '<vault-session>'), 1,
+      'the first pre-step must carry the bootstrap exactly once, got: ' + JSON.stringify(injectedText(first)))
+
+    // Let every still-detached hook land, then prove no second bootstrap is left.
+    await sleep(SETTLE_MS)
+    const second = await preStep(handlers, session, 2)
+    assert.equal(countOf(injectedText(second), '<vault-session>'), 0,
+      'a later pre-step must not receive a second bootstrap, got: ' + JSON.stringify(injectedText(second)))
+
+    const spawned = hookLog(env.logPath).filter((hook) => BOOTSTRAP_HOOKS.includes(hook))
+    const counts = {}
+    for (const hook of spawned) counts[hook] = (counts[hook] || 0) + 1
+    assert.deepEqual(counts, { 'session-bootstrap': 1, 'curator-nudge': 1, 'staleness-check': 1 },
+      'a repeated creation event must not double-spawn the bootstrap hooks, spawned: ' + JSON.stringify(spawned))
+    dispose()
+  } finally {
+    rmSync(env.root, { recursive: true, force: true })
+  }
+})

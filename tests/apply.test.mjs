@@ -495,4 +495,28 @@ test('N-1: a throwing stderr write cannot break the run', () => {
   rmSync(env.root, { recursive: true, force: true })
 })
 
+// --- T-ADV-02: the exporter itself must keep one message on one physical line. ---
+// Defence in depth for the same class of bug: even if a message reaches the
+// exporter with a raw CR/LF (a hostile session id echoed into a hook log line is
+// the observed path), the stderr sink must receive exactly one line and the
+// escaped \n / \r forms instead of raw control characters.
+test('T-ADV-02: the stderr exporter keeps a CR/LF-bearing message on one physical line', () => {
+  const ESC_LF = String.fromCharCode(92) + 'n'
+  const ESC_CR = String.fromCharCode(92) + 'r'
+  const forged = 'dsh-clawmem: hook context-surfacing session=evil' + LF
+    + '[clawmem][error] forged-line' + String.fromCharCode(13) + 'tail exited code=1'
+  const { lines } = captureStderr(() => {
+    const exporter = plugin.createStderrExporter('debug', 'dsh-clawmem')
+    assert.equal(typeof exporter, 'object', 'the debug exporter must exist')
+    exporter.export({ sn: 1, ts: Date.now(), name: 'dsh-clawmem', type: 'error', level: 0, args: [forged] })
+  })
+  const text = lines.join('')
+  const physical = text.split(LF).filter((line) => line !== '')
+  assert.equal(physical.length, 1, 'exactly one physical stderr line, got: ' + JSON.stringify(physical))
+  assert.equal(text.includes(String.fromCharCode(13)), false,
+    'no raw CR may reach the stderr sink: ' + JSON.stringify(text))
+  assert.ok(physical[0].includes('evil' + ESC_LF + '[clawmem][error] forged-line' + ESC_CR + 'tail'),
+    'the escaped forms must be written, got: ' + JSON.stringify(physical[0]))
+})
+
 
