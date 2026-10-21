@@ -99,6 +99,25 @@ test('agent/pre-step folds surfaced context into the enter decision', async () =
   rmSync(env.root, { recursive: true, force: true })
 })
 
+test('the injected context carries a producer-owned source kind (session format v4)', async () => {
+  // A durable v4 message must name its producer; the retired catch-all
+  // { kind: 'plugin' } is refused by session-format admission, which aborted
+  // every pre-step that carried ClawMem context on dsh 0.2.1.
+  const env = setup()
+  const { ctx, handlers } = makeCtx()
+  apply(ctx, { clawmemBin: env.bin, transcript: { dir: env.root, rotation: { enabled: false } } })
+  const handler = handlers.get('agent/pre-step')[0].fn
+  const payload = { agent: { session: { id: 'sess-src', header: {} } }, messages: [{ content: [{ type: 'text', text: 'please recall the auth decision from memory' }] }], turn: 1, step: 1 }
+  const result = await handler(payload, async () => ({ kind: 'enter', messages: [] }))
+  assert.equal(result.messages.length, 1)
+  const source = result.messages[0].source
+  assert.notEqual(source.kind, 'plugin', 'the catch-all plugin kind is retired in session format v4')
+  assert.equal(source.kind, 'plugin:dsh-clawmem')
+  assert.equal(source.form, 'snapshot')
+  assert.deepEqual(source.sections.map((section) => section.name), ['dsh-clawmem'])
+  rmSync(env.root, { recursive: true, force: true })
+})
+
 test('subagent sessions are skipped (no skill or transcript side effects)', async () => {
   const env = setup()
   const { ctx, handlers } = makeCtx()
