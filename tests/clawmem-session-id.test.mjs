@@ -136,7 +136,7 @@ test('O2 end-to-end: every hook invocation carries the same derived id, transcri
     surfacing: { minPromptChars: 1 },
   })
   const session = { id: DSH_ID, header: {} }
-  await handlers.get('agent/session-start')[0].fn({ agent: { session } })
+  await handlers.get('agent/created')[0].fn({ agent: { session } })
   handlers.get('session/event')[0].fn(session, { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'real user input' }] } })
   handlers.get('session/event')[0].fn(session, { type: 'compaction/start', data: {} })
   handlers.get('session/event')[0].fn(session, { type: 'compaction/end', data: {} })

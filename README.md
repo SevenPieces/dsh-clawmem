@@ -228,7 +228,7 @@ reported **once at warn/error and never repeated by the call site**: the transpo
 `lib/clawmem.js` carries the hook name, the session id (when the hook input has one), the
 elapsed milliseconds and, on a non-zero exit, the exit code plus the close `signal` (`none`
 when the child reported none) and — when `logging.logHookStderr` is true — the captured stderr
-text. The call-site reason (`pre-step`, `session-start`, per-turn extraction, `pending kept`)
+text. The call-site reason (`pre-step`, `created`, per-turn extraction, `pending kept`)
 is emitted at **debug** instead. A failing hook therefore normally costs exactly one visible warn
 line — the call site never repeats it, with the capped-stderr exception noted below — while the
 reason stays available under `logging.level: debug` (a client that reports no line of its own
@@ -380,7 +380,7 @@ focus and multi-turn surfacing key on the **full** id, so those were already per
 
 `clawmemSessionId` (the helper in `lib/index.js`) now strips **one** leading `session-` from the id
 the plugin hands to ClawMem, and every hook payload goes through it - the `runPrecompact` and
-`runExtract` helpers, the `agent/session-start` bootstrap loop, the `context-surfacing` call in
+`runExtract` helpers, the `agent/created` bootstrap loop, the `context-surfacing` call in
 `agent/pre-step` and the `postcompact-inject` call site there (all in `lib/index.js`) - so artifact
 names and `context_usage` rows are per session (session focus and multi-turn history already were,
 because ClawMem keys them on the full id). An id without that prefix (a bare-uuid subagent id) is

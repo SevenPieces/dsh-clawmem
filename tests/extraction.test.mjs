@@ -579,7 +579,7 @@ test('listeners, the sweep interval and transcripts.close() are effect-scoped (M
   const env = setup()
   const { ctx, handlers, logs, effects, registered } = makeCtx({ snapshot: () => ({ asOfSeq: 0, values: {} }) })
   const dispose = apply(ctx, baseConfig(env, { transcript: { dir: env.root, rotation: { enabled: true, sweepIntervalHours: 24 } } }))
-  for (const event of ['session/event', 'agent/session-start', 'agent/pre-step', 'agent/turn-stopping']) {
+  for (const event of ['session/event', 'agent/created', 'agent/pre-step', 'agent/turn-stopping']) {
     assert.ok(effects.some((label) => String(label).includes(event)), 'effect registered for ' + event + ': ' + JSON.stringify(effects))
   }
   assert.ok(effects.some((label) => String(label).includes('rotation')), 'effect registered for the sweep interval: ' + JSON.stringify(effects))

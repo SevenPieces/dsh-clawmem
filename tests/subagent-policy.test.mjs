@@ -67,7 +67,7 @@ async function exercise(env, session) {
     { agent: { session }, messages: [{ content: [{ type: 'text', text: 'please recall the auth decision from memory' }] }], turn: 1, step: 1 },
     async () => ({ kind: 'enter', messages: [] }),
   )
-  handlers.get('agent/session-start')[0]({ agent: { session } })
+  handlers.get('agent/created')[0]({ agent: { session } })
   await handlers.get('agent/turn-stopping')[0]({ agent: { session } })
   await sleep(250)
   const spawned = readFileSync(env.logPath, 'utf8').trim() === '' ? [] : readFileSync(env.logPath, 'utf8').trim().split(LF)

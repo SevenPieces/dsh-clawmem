@@ -24,7 +24,8 @@
     "prepublishOnly": "node --test tests/*.test.mjs"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22",
+    "dsh": ">=0.2.1"
   },
   "license": "MIT",
   "repository": {
