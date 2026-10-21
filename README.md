@@ -508,13 +508,16 @@ plugin deliberately conforms to, or a trade-off that was reviewed and accepted r
   `agent/created` handler starts `session-bootstrap`, `curator-nudge`, and `staleness-check`
   without awaiting them, and that first step awaits the stored promise so the bootstrap text lands
   on it; each hook is bounded by its own transport timeout (the 2 s surfacing default), so the wait
-  is at most their sum - 3 × 2 s = 6 s with all three enabled and less as they are disabled.
+  is about their sum - about 6 s with all three enabled (3 × 2 s plus a few ms of per-hook
+  timer/scheduling overhead) and less as they are disabled.
 - **Session ids are sanitised lossily for names outside the transcript alphabet.** Each session id
   becomes one directory segment by replacing every character outside `[A-Za-z0-9._-]` with `_`
   (an all-dots id becomes one underscore per dot, an empty id becomes `_`), so two distinct foreign
-  ids such as `a/b` and `a_b` share a single transcript directory whose lines interleave.
-  DSH-generated ids (`session-<uuid>` and bare uuids) use only allowed characters and are
-  unaffected. The mapping is what guarantees no path traversal, but it is not injective.
+  ids such as `a/b` and `a_b` share a single transcript directory whose lines interleave. The
+  collision is not only the transcript: both ids also share `memory/precompact-state.md`, so the
+  post-compaction path can inject one session with the other's pre-compaction state. DSH-generated
+  ids (`session-<uuid>` and bare uuids) use only allowed characters, so two different generated
+  ids never collide. The mapping is what guarantees no path traversal, but it is not injective.
 
 ## License
 

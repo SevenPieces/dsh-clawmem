@@ -244,3 +244,56 @@ test('T-F1 control: a legacy block-level toolCallId result still maps (replay co
     rmSync(env.root, { recursive: true, force: true })
   }
 })
+
+// --- T-ADV5-04: a legacy v3 tool-result wrapper may carry bare strings inside
+// its nested content array. textOf() mapped only typed blocks, so a bare string
+// was dropped - the reasoning block is correctly excluded, but the visible text
+// vanished with it. Required: keep strings at any nesting level; never reason.
+test('T-ADV5-04: a bare string inside a nested legacy tool-result array survives (reasoning excluded)', () => {
+  const env = setup()
+  try {
+    const { ctx, handlers } = makeCtx()
+    apply(ctx, { clawmemBin: env.bin, transcript: { dir: env.root, rotation: { enabled: false } } })
+    emitToolResult(handlers, { id: 'sess-legacy-string', header: {} }, {
+      role: 'tool',
+      content: [{
+        type: 'tool-result',
+        toolCallId: 'call_legacy_string',
+        content: ['keep', { type: 'reasoning', text: 'PRIVATE' }],
+        isError: false,
+      }],
+    })
+    const lines = readTranscript(env.root, 'sess-legacy-string')
+    assert.equal(lines.length, 1)
+    const block = lines[0].message.content[0]
+    assert.equal(block.tool_use_id, 'call_legacy_string')
+    assert.equal(block.content, 'keep',
+      'a bare string in a nested tool-result content array must be kept, got ' + JSON.stringify(block.content))
+    assert.ok(!JSON.stringify(lines[0]).includes('PRIVATE'),
+      'reasoning text must not leak into the transcript: ' + JSON.stringify(lines[0]))
+  } finally {
+    rmSync(env.root, { recursive: true, force: true })
+  }
+})
+
+// T-ADV5-04 control: the top-level string path already worked and must keep
+// working - the fix widens textOf(), it must not narrow blockTextOf().
+test('T-ADV5-04 control: a bare top-level string block is still kept', () => {
+  const env = setup()
+  try {
+    const { ctx, handlers } = makeCtx()
+    apply(ctx, { clawmemBin: env.bin, transcript: { dir: env.root, rotation: { enabled: false } } })
+    emitToolResult(handlers, { id: 'sess-top-string', header: {} }, {
+      role: 'tool',
+      toolCallId: 'call_top_string',
+      isError: false,
+      content: ['top-level keep', { type: 'text', text: 'visible' }],
+    })
+    const block = readTranscript(env.root, 'sess-top-string')[0].message.content[0]
+    assert.equal(block.tool_use_id, 'call_top_string')
+    assert.equal(block.content, 'top-level keep' + LF + 'visible',
+      'existing top-level string behaviour must be preserved, got ' + JSON.stringify(block.content))
+  } finally {
+    rmSync(env.root, { recursive: true, force: true })
+  }
+})

@@ -9,11 +9,15 @@ import {
   readdirSync,
   rmSync,
   statSync,
+  lstatSync,
+  accessSync,
+  constants as fsConstants,
   symlinkSync,
   utimesSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 import { createTranscriptManager } from '../lib/transcript.js';
 // Namespace import (not a named import) so a missing export fails one test
@@ -1206,4 +1210,183 @@ test('T-V3-01: an identical unpaired-surrogate re-delivery is still de-duped (on
     assert.equal(lines[0].message.content[0].content, LONE_SURROGATE);
     assert.equal(lines[0].message.content[0].is_error, false);
   });
+});
+
+// --- T-ADV5-02: the rotation mtime walk must not follow symlinks. sweep() is
+// synchronous and runs at activation and on every interval; newestMtimeMs()
+// stat'ed each entry and recursed into any directory, a symlink target included.
+// A symlink to /usr therefore walked ~100k system files inside the host event
+// loop and did not finish in 12 s in a bounded probe, freezing the DSH session.
+// Required: lstat the entry itself and never descend into a symlink. Because a
+// pre-fix sweep would block this process's event loop (a timeout registered here
+// could never fire), the sweep runs in a child process with a hard timeout; the
+// expected red is that timeout, or a reported sweep elapsed >= 2000 ms.
+
+const POSIX_LARGE_DIR = '/usr';
+const LARGE_DIR_SKIP = (() => {
+  if (process.platform === 'win32') return 'symlink creation needs extra privileges on win32';
+  try {
+    if (!lstatSync(POSIX_LARGE_DIR).isDirectory()) return POSIX_LARGE_DIR + ' is not a directory';
+    accessSync(POSIX_LARGE_DIR, fsConstants.R_OK);
+  } catch (err) {
+    return POSIX_LARGE_DIR + ' is not readable: ' + String((err && err.message) || err);
+  }
+  return false;
+})();
+const SYMLINK_SKIP = process.platform === 'win32' ? 'symlink creation needs extra privileges on win32' : false;
+
+test('T-ADV5-02: sweep() never follows a symlink to a large external directory', { skip: LARGE_DIR_SKIP }, () => {
+  const host = tmpRoot();
+  const base = join(host, 'transcripts');
+  const session = join(base, 'session-symlink-large');
+  try {
+    mkdirSync(session, { recursive: true });
+    writeFileSync(join(session, 'transcript.jsonl'), '{"kept":true}' + LF);
+    const old = new Date(Date.now() - 400 * DAY_MS);
+    utimesSync(join(session, 'transcript.jsonl'), old, old);
+    utimesSync(session, old, old);
+    // Created last, so the link's OWN mtime is fresh while everything else in
+    // the store is aged.
+    const link = join(session, 'large-external');
+    symlinkSync(POSIX_LARGE_DIR, link, 'dir');
+    const linkMtime = lstatSync(link).mtimeMs;
+    assert.ok(Date.now() - linkMtime < 60 * 1000, 'the symlink itself was just created');
+
+    // A synchronous sweep would block this process, so a timeout registered in
+    // it could never fire; fork the sweep into a child that can be SIGTERM'd.
+    const libUrl = new URL('../lib/transcript.js', import.meta.url).href;
+    const runner = join(host, 'sweep-runner.mjs');
+    writeFileSync(runner, [
+      'import { createTranscriptManager } from ' + JSON.stringify(libUrl) + ';',
+      'const manager = createTranscriptManager({ dir: ' + JSON.stringify(base) +
+        ', rotation: { enabled: true, maxAgeDays: 180, sweepIntervalHours: 24 } });',
+      'const startedAt = Date.now();',
+      'const summary = manager.sweep();',
+      'process.stdout.write(JSON.stringify({ summary, elapsedMs: Date.now() - startedAt }));',
+    ].join(LF));
+
+    const child = spawnSync(process.execPath, [runner], { encoding: 'utf8', timeout: 4000 });
+    assert.notEqual(child.error && child.error.code, 'ETIMEDOUT',
+      'sweep() did not return within 4000 ms: the symlink target was walked (expected lstat + no descent); stdout=' +
+        JSON.stringify(child.stdout) + ' stderr=' + JSON.stringify(child.stderr));
+    assert.equal(child.status, 0, 'the sweep runner must exit cleanly: ' + JSON.stringify(child.stderr));
+    const observed = JSON.parse(child.stdout);
+    assert.ok(observed.elapsedMs < 2000,
+      'sweep() must return quickly; took ' + observed.elapsedMs + ' ms - a symlink target must never be walked');
+    assert.deepEqual(observed.summary, { removed: 0, kept: 1, errors: 0 },
+      'the aged store holding a fresh symlink must be kept, got ' + JSON.stringify(observed.summary));
+
+    assert.equal(lstatSync(link).isSymbolicLink(), true, 'the symlink must survive');
+    assert.equal(existsSync(join(session, 'transcript.jsonl')), true, 'the owned transcript must survive');
+    assert.equal(readFileSync(join(session, 'transcript.jsonl'), 'utf8'), '{"kept":true}' + LF,
+      'the transcript content must be untouched');
+    assert.equal(existsSync(POSIX_LARGE_DIR), true, 'the external target must not be deleted');
+  } finally {
+    rmSync(host, { recursive: true, force: true });
+  }
+});
+
+test('T-ADV5-02: a symlink\'s own mtime (lstat) is used and target files are never deleted',
+  { skip: SYMLINK_SKIP }, () => {
+  const host = tmpRoot();
+  const base = join(host, 'transcripts');
+  const session = join(base, 'session-symlink-mtime');
+  const external = join(host, 'external-store');
+  try {
+    mkdirSync(session, { recursive: true });
+    mkdirSync(external, { recursive: true });
+    writeFileSync(join(session, 'transcript.jsonl'), '{"kept":true}' + LF);
+    writeFileSync(join(external, 'keep.txt'), 'external file that must survive' + LF);
+    const old = new Date('2020-01-01T00:00:00Z');
+    for (const p of [join(session, 'transcript.jsonl'), session, join(external, 'keep.txt'), external]) {
+      utimesSync(p, old, old);
+    }
+    const link = join(session, 'external-old');
+    symlinkSync(external, link, 'dir'); // its own (lstat) mtime is now
+    const linkMtime = lstatSync(link).mtimeMs;
+    const targetMtime = statSync(external).mtimeMs;
+    assert.ok(targetMtime < linkMtime - 365 * DAY_MS,
+      'premise: the link target is genuinely aged while the link itself is fresh');
+
+    const summary = createTranscriptManager({ dir: base, rotation: { enabled: true, maxAgeDays: 180 } }).sweep();
+
+    assert.deepEqual(summary, { removed: 0, kept: 1, errors: 0 },
+      'a fresh symlink mtime must keep the aged store; got ' + JSON.stringify(summary));
+    assert.equal(lstatSync(link).isSymbolicLink(), true, 'the symlink must not be followed or deleted');
+    assert.equal(readFileSync(join(external, 'keep.txt'), 'utf8'), 'external file that must survive' + LF,
+      'no file behind the symlink may be deleted');
+  } finally {
+    rmSync(host, { recursive: true, force: true });
+  }
+});
+
+// --- T-ADV5-03: createTranscriptManager is a documented direct API, and its
+// rotation.maxAgeDays was not normalised (only the config loader did that). A
+// NaN/'abc' value makes `Date.now() - maxAgeDays * DAY_MS` NaN, so every
+// `newest >= cutoff` comparison is false and EVERY owned store counts as aged;
+// -5 pushes the cutoff into the future and does the same. The manager must
+// normalise its own input: a finite value >= 1, else the 180-day default.
+
+const GARBAGE_MAX_AGE_DAYS = [
+  ['NaN', NaN],
+  ["'abc'", 'abc'],
+  ['-5', -5],
+];
+
+test('T-ADV5-03: a garbage rotation.maxAgeDays never deletes a recent owned store (normalised to 180)', () => {
+  for (const [label, value] of GARBAGE_MAX_AGE_DAYS) {
+    const host = tmpRoot();
+    const base = join(host, 'transcripts');
+    const recent = join(base, 'session-recent');
+    const hundredDays = join(base, 'session-100-days');
+    try {
+      mkdirSync(recent, { recursive: true });
+      writeFileSync(join(recent, 'transcript.jsonl'), '{"kept":true}' + LF);
+      mkdirSync(hundredDays, { recursive: true });
+      writeFileSync(join(hundredDays, 'transcript.jsonl'), '{"kept":true}' + LF);
+      const old = new Date(Date.now() - 100 * DAY_MS);
+      utimesSync(hundredDays, old, old);
+      utimesSync(join(hundredDays, 'transcript.jsonl'), old, old);
+
+      const manager = createTranscriptManager({
+        dir: base,
+        rotation: { enabled: true, maxAgeDays: value, sweepIntervalHours: 24 },
+      });
+      const summary = manager.sweep();
+
+      assert.deepEqual(summary, { removed: 0, kept: 2, errors: 0 },
+        'maxAgeDays ' + label + ' must normalise to the 180-day default, got ' + JSON.stringify(summary));
+      assert.equal(existsSync(recent), true, 'maxAgeDays ' + label + ' must not delete a just-written store');
+      assert.equal(readFileSync(join(recent, 'transcript.jsonl'), 'utf8'), '{"kept":true}' + LF);
+      assert.equal(existsSync(hundredDays), true, 'a 100-day store is younger than the 180-day fallback');
+    } finally {
+      rmSync(host, { recursive: true, force: true });
+    }
+  }
+});
+
+test('T-ADV5-03 control: the 180-day fallback still removes a genuinely aged store', () => {
+  for (const [label, value] of GARBAGE_MAX_AGE_DAYS) {
+    const host = tmpRoot();
+    const base = join(host, 'transcripts');
+    const aged = join(base, 'session-400-days');
+    try {
+      mkdirSync(aged, { recursive: true });
+      writeFileSync(join(aged, 'transcript.jsonl'), '{"kept":true}' + LF);
+      const old = new Date(Date.now() - 400 * DAY_MS);
+      utimesSync(aged, old, old);
+      utimesSync(join(aged, 'transcript.jsonl'), old, old);
+
+      const summary = createTranscriptManager({
+        dir: base,
+        rotation: { enabled: true, maxAgeDays: value, sweepIntervalHours: 24 },
+      }).sweep();
+
+      assert.deepEqual(summary, { removed: 1, kept: 0, errors: 0 },
+        'maxAgeDays ' + label + ' must still rotate a 400-day store, got ' + JSON.stringify(summary));
+      assert.equal(existsSync(aged), false, 'the 180-day fallback must remove a 400-day store');
+    } finally {
+      rmSync(host, { recursive: true, force: true });
+    }
+  }
 });
