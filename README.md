@@ -109,10 +109,22 @@ Three of the guards need a tool the rest of the suite does not: `git` (the repos
 `DSH_CLAWMEM_ALLOW_NO_GIT=1`, `DSH_CLAWMEM_ALLOW_NO_NPM=1` or `DSH_CLAWMEM_ALLOW_NO_YAML=1` to turn
 that specific failure into a reported skip when the environment genuinely cannot provide the tool.
 
+The publication/identity guard (`tests/publication-surface.test.mjs`) walks the **whole working
+tree** - untracked and gitignored files included, not just what git tracks. A local scratch directory that
+contains machine paths (a home directory, a hostname) therefore turns the suite red even though
+the shipped files are unchanged. Run the suite from a clean checkout or a `git archive`
+extraction, or delete such scratch first, before treating a red run as a regression.
+
 ## Configuration reference
 
 Every value below is the code's actual default and is read from the Cordis plugin config at
 activation; a malformed value is repaired to that default and logged at warn (fail-open).
+Values that arm a Node timer are additionally capped at the platform maximum - `2147483647` ms,
+i.e. 596 whole hours for `transcript.rotation.sweepIntervalHours`. An oversized value is
+repaired **to that maximum**, not to the default, and logged at warn: Node coerces a larger
+delay to 1 ms, so accepting it would fire every hook timeout immediately and run the rotation
+sweep about a thousand times a second. The hook transport applies the same cap to a
+caller-supplied timeout, and its timeout log quotes the effective (clamped) limit.
 
 `clawmemBin` has no absolute default: it is resolved once at startup, first hit wins - an explicit
 `clawmemBin` from the config, then `$CLAWMEM_BIN`, then the first **regular executable file** named
@@ -380,6 +392,14 @@ also runs **at activation**, before that interval is armed, so a process restart
 (`transcript.rotation.enabled: false`) stops all pruning. Write and rotation failures are logged,
 never thrown.
 
+Deletion is narrowly scoped: an aged session directory is removed recursively **only** when its
+entire inventory is this plugin's own session store - nothing at all (an empty directory), and/or
+a regular file `transcript.jsonl`, and/or a real `memory/` directory whose own entries are empty
+or only a regular file `precompact-state.md`. Any other content - an extra or hidden file, a
+`transcript.jsonl` that is a symlink or a directory, a `memory` that is not a real directory or
+holds anything else - keeps the **whole** directory (counted as kept); nothing inside it is
+deleted.
+
 ### Session identity handed to ClawMem
 
 ClawMem names its per-session artifacts from `sessionId.slice(0, 8)`
@@ -478,6 +498,12 @@ plugin deliberately conforms to, or a trade-off that was reviewed and accepted r
   unbounded over the process lifetime; only `transcripts.close()` on disposal clears it.
 - **`staleness-check` cannot emit `additionalContext`.** ClawMem maps that hook to a null event, so the
   plugin can run it (when `bootstrap.stalenessCheck` is true) but it contributes no context.
+- **Session ids are sanitised lossily for names outside the transcript alphabet.** Each session id
+  becomes one directory segment by replacing every character outside `[A-Za-z0-9._-]` with `_`
+  (an all-dots id becomes one underscore per dot, an empty id becomes `_`), so two distinct foreign
+  ids such as `a/b` and `a_b` share a single transcript directory whose lines interleave.
+  DSH-generated ids (`session-<uuid>` and bare uuids) use only allowed characters and are
+  unaffected. The mapping is what guarantees no path traversal, but it is not injective.
 
 ## License
 

@@ -345,3 +345,91 @@ test('F-2: an invalid skill.name is repaired loudly and falls back to clawmem', 
   assert.deepEqual(configIssues({}), [], 'an absent skill section is a default, not a repair')
 })
 
+// --- T-ADV3-01 (MEDIUM): a rotation sweep interval above the 32-bit timer
+//     maximum was passed to setInterval() unchanged. Node clamps such a delay to
+//     1 ms (TimeoutOverflowWarning), turning a monthly/yearly pruning interval
+//     into a busy sweep loop. The config repair must clamp it to the largest
+//     whole-hour delay the timer accepts: floor((2**31 - 1) / 3600000) = 596 h.
+const MAX_SWEEP_HOURS = 596
+
+test('T-ADV3-01: a rotation sweep interval above the timer maximum is repaired to 596 h and reported', () => {
+  const repaired = resolveConfig({ transcript: { rotation: { sweepIntervalHours: 720 } } })
+  assert.equal(repaired.transcript.rotation.sweepIntervalHours, MAX_SWEEP_HOURS,
+    '720 h (2592000000 ms) exceeds the 32-bit timer maximum and must be clamped to 596 h')
+  const issues = configIssues({ transcript: { rotation: { sweepIntervalHours: 720 } } })
+  assert.equal(issues.length, 1, 'exactly one repair issue, got ' + JSON.stringify(issues))
+  assert.ok(issues[0].includes('transcript.rotation.sweepIntervalHours'),
+    'the issue names the repaired key: ' + issues[0])
+
+  // The maximum itself is a valid configured value and is not reported.
+  assert.equal(resolveConfig({ transcript: { rotation: { sweepIntervalHours: MAX_SWEEP_HOURS } } }).transcript.rotation.sweepIntervalHours, MAX_SWEEP_HOURS)
+  assert.deepEqual(configIssues({ transcript: { rotation: { sweepIntervalHours: MAX_SWEEP_HOURS } } }), [],
+    '596 h is accepted without a repair issue')
+
+  // The boundary is exact: one hour above the maximum repairs too.
+  assert.equal(resolveConfig({ transcript: { rotation: { sweepIntervalHours: 597 } } }).transcript.rotation.sweepIntervalHours, MAX_SWEEP_HOURS,
+    '597 h (2149200000 ms) is one hour past the maximum and must be repaired to 596 h')
+  const above = configIssues({ transcript: { rotation: { sweepIntervalHours: 597 } } })
+  assert.equal(above.length, 1, '597 h is repaired and reported: ' + JSON.stringify(above))
+  assert.ok(above[0].includes('transcript.rotation.sweepIntervalHours'), 'the issue names the key: ' + above[0])
+})
+
+test('T-ADV3-01: the interval handed to setInterval for a 720 h config is within the platform range', () => {
+  const root = mkdtempSync(join(tmpdir(), 'clawmem-rotation-interval-'))
+  // Capture the delay without scheduling a real timer: the defect is the value
+  // handed to setInterval, and a real overflowing timer would clamp to 1 ms and
+  // sweep in a loop.
+  const realSetInterval = globalThis.setInterval
+  const captured = []
+  globalThis.setInterval = function (fn, delay) {
+    captured.push(delay)
+    return { unref() {}, ref() {} }
+  }
+  let dispose
+  try {
+    const { ctx } = makeCtx()
+    dispose = apply(ctx, {
+      clawmemBin: '/bin/false',
+      transcript: { dir: root, rotation: { enabled: true, sweepIntervalHours: 720 } },
+    })
+  } finally {
+    globalThis.setInterval = realSetInterval
+  }
+  try {
+    assert.equal(captured.length, 1, 'rotation registers exactly one interval: ' + JSON.stringify(captured))
+    const delay = captured[0]
+    assert.ok(delay <= 2147483647,
+      'the delay passed to setInterval must fit the 32-bit timer limit, got ' + delay)
+    assert.notEqual(delay, 1,
+      "an overflowing interval must never reach setInterval as Node's 1 ms clamp")
+  } finally {
+    if (typeof dispose === 'function') dispose()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// --- T-ADV3-02 (LOW): the surfacing/precompact/extraction hook timeouts were
+//     passed to setTimeout() unclamped for the same reason. A value above
+//     2**31 - 1 must repair to the timer maximum, not reach the timer raw.
+const MAX_HOOK_TIMEOUT_MS = 2147483647
+
+test('T-ADV3-02: hook timeouts above the 32-bit timer maximum are repaired to 2147483647 ms', () => {
+  const cases = [
+    ['surfacing', { surfacing: { timeoutMs: 3000000000 } }, 'surfacing.timeoutMs'],
+    ['precompact', { precompact: { timeoutMs: 3000000000 } }, 'precompact.timeoutMs'],
+    ['extraction', { extraction: { timeoutMs: 3000000000 } }, 'extraction.timeoutMs'],
+  ]
+  for (const [section, raw, label] of cases) {
+    assert.equal(resolveConfig(raw)[section].timeoutMs, MAX_HOOK_TIMEOUT_MS,
+      section + '.timeoutMs must be clamped to the 32-bit timer maximum')
+    const issues = configIssues(raw)
+    assert.equal(issues.length, 1, 'exactly one repair issue for ' + section + ': ' + JSON.stringify(issues))
+    assert.ok(issues[0].includes(label), 'the issue names ' + label + ': ' + issues[0])
+
+    // The maximum itself is accepted and is not reported as repaired.
+    const atMax = { [section]: { timeoutMs: MAX_HOOK_TIMEOUT_MS } }
+    assert.equal(resolveConfig(atMax)[section].timeoutMs, MAX_HOOK_TIMEOUT_MS, label + ' = 2**31-1 is a valid value')
+    assert.deepEqual(configIssues(atMax), [], label + ' = 2**31-1 must not be reported as repaired')
+  }
+})
+

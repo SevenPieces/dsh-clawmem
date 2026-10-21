@@ -690,3 +690,65 @@ test('T-ADV-02: a session id carrying CR/LF cannot forge a log line', async () =
   }
 })
 
+// --- T-ADV3-02 (LOW): runHook passed a caller-supplied timeout above the
+//     32-bit timer maximum straight to setTimeout(). Node clamps that to 1 ms,
+//     so every hook "timed out after 2 ms (limit 3000000000ms)" while the timer
+//     never honoured the limit; the log quoted a limit the timer never received.
+const SLEEP_THEN_OK_BIN = [
+  'await new Promise(function (resolve) { setTimeout(resolve, 100) })',
+  'process.stdout.write(JSON.stringify({ hookSpecificOutput: { additionalContext: "CTX:slow" } }))',
+]
+
+test('T-ADV3-02: a hook timeout above the timer maximum no longer clamps to 1 ms', async () => {
+  const dir = makeDir()
+  try {
+    const bin = writeBin(dir, 'slow-ok.mjs', SLEEP_THEN_OK_BIN)
+    const rec = recordingLogger()
+    const client = createClawmemClient({ bin: bin, logger: rec.logger })
+    const r = await client.runHook('context-surfacing', { session_id: 'sess-adv3-02' }, 3000000000)
+    assert.equal(r.timedOut, false, "the 3e9 ms limit must not become Node's 1 ms overflow clamp")
+    assert.equal(r.ok, true, 'a hook sleeping ~100 ms must complete under a 3e9 ms limit')
+    assert.equal(extractContext(r.stdout), 'CTX:slow')
+    assert.ok(r.ms >= 80, 'the hook really ran for about 100 ms, took ' + r.ms + 'ms')
+    assert.deepEqual(rec.calls, [], 'a successful hook logs nothing')
+  } finally {
+    cleanup(dir)
+  }
+})
+
+test('T-ADV3-02: the timeout log quotes the limit actually handed to setTimeout', async () => {
+  const dir = makeDir()
+  // Exercise the timeout path without waiting out a platform-sized limit: a
+  // long requested delay is recorded and capped to 10 ms, so the timer that
+  // runHook installed fires now. The logged limit must equal what was requested
+  // (and fit the 32-bit timer range), never a configured value the timer did
+  // not receive.
+  const realSetTimeout = globalThis.setTimeout
+  const requested = []
+  globalThis.setTimeout = function (fn, delay, ...args) {
+    if (typeof delay === 'number' && delay > 1000) {
+      requested.push(delay)
+      return realSetTimeout(fn, 10, ...args)
+    }
+    return realSetTimeout(fn, delay, ...args)
+  }
+  try {
+    const bin = writeBin(dir, 'hang.mjs', HANG_BIN)
+    const rec = recordingLogger()
+    const client = createClawmemClient({ bin: bin, logger: rec.logger })
+    const r = await client.runHook('context-surfacing', { session_id: 'sess-adv3-02-limit' }, 3000000000)
+    assert.equal(r.timedOut, true, 'the capped timer must exercise the timeout path')
+    assert.equal(requested.length, 1, 'exactly one long timer was requested: ' + JSON.stringify(requested))
+    const effective = requested[0]
+    assert.ok(effective <= 2147483647,
+      'the delay handed to setTimeout must fit the 32-bit timer limit, got ' + effective)
+    assert.notEqual(effective, 1, 'the delay must not be a 1 ms overflow clamp')
+    assert.equal(rec.calls.length, 1, 'the timeout logs exactly once: ' + JSON.stringify(rec.calls))
+    assert.match(rec.calls[0].message, new RegExp('limit ' + effective + 'ms'),
+      'the timeout message must quote the effective limit ' + effective + 'ms: ' + rec.calls[0].message)
+  } finally {
+    globalThis.setTimeout = realSetTimeout
+    cleanup(dir)
+  }
+})
+
