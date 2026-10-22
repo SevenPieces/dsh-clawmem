@@ -297,3 +297,78 @@ test('T-ADV5-04 control: a bare top-level string block is still kept', () => {
     rmSync(env.root, { recursive: true, force: true })
   }
 })
+
+// --- T-ADV6-02 (LOW, transcript fidelity): a tool/result that maps to NO text must
+//     append no transcript line at all. The README's transcript contract excludes
+//     "reasoning blocks, and empty content lines", and appendUser enforces the same
+//     invariant; the tool-result path only filtered falsy mapped blocks, so a
+//     reasoning-only or empty-text result still appended a tool_result with
+//     content:''. An empty mapped result is not transcript content, even though its
+//     dedupe state may still be recorded.
+function transcriptLinesIfAny(root, sessionId) {
+  const path = join(root, sessionId, 'transcript.jsonl')
+  if (!existsSync(path)) return []
+  return readFileSync(path, 'utf8').split(LF).filter(Boolean).map((line) => JSON.parse(line))
+}
+
+test('T-ADV6-02: a live tool result whose mapped text is empty appends no transcript line', () => {
+  const env = setup()
+  try {
+    const { ctx, handlers } = makeCtx()
+    apply(ctx, { clawmemBin: env.bin, transcript: { dir: env.root, rotation: { enabled: false } } })
+    const shapes = [
+      ['reasoning-only', [{ type: 'reasoning', text: 'PRIVATE' }]],
+      ['empty-text', [{ type: 'text', text: '' }]],
+    ]
+    for (const [label, content] of shapes) {
+      const session = { id: 'sess-empty-' + label, header: {} }
+      emitToolResult(handlers, session, liveMessage({ toolCallId: 'call_' + label, isError: false, content }))
+      assert.equal(transcriptLinesIfAny(env.root, session.id).length, 0,
+        label + ': a result with no mapped text must not append an empty line')
+      // An empty RE-DELIVERY must add nothing either (it is not content the first time).
+      emitToolResult(handlers, session, liveMessage({ toolCallId: 'call_' + label, isError: false, content }))
+      const lines = transcriptLinesIfAny(env.root, session.id)
+      assert.equal(lines.length, 0, label + ': an empty re-delivery must not append a line')
+      if (existsSync(join(env.root, session.id, 'transcript.jsonl'))) {
+        assert.equal(readFileSync(join(env.root, session.id, 'transcript.jsonl'), 'utf8').includes('PRIVATE'), false,
+          label + ': reasoning text must never reach the transcript')
+      }
+    }
+  } finally {
+    rmSync(env.root, { recursive: true, force: true })
+  }
+})
+
+test('T-ADV6-02 control: a non-empty live tool result still appends exactly one line, and an empty re-delivery adds nothing', () => {
+  const env = setup()
+  try {
+    const { ctx, handlers } = makeCtx()
+    apply(ctx, { clawmemBin: env.bin, transcript: { dir: env.root, rotation: { enabled: false } } })
+    const session = { id: 'sess-empty-control', header: {} }
+    emitToolResult(handlers, session, liveMessage({
+      toolCallId: 'call_real',
+      isError: false,
+      content: [{ type: 'text', text: 'real output' }],
+    }))
+    const lines = transcriptLinesIfAny(env.root, session.id)
+    assert.equal(lines.length, 1, 'a non-empty result appends exactly one line')
+    assert.equal(lines[0].message.content[0].tool_use_id, 'call_real')
+    assert.equal(lines[0].message.content[0].content, 'real output')
+
+    // Empty results arriving afterwards must not add an empty line beside the real one.
+    emitToolResult(handlers, session, liveMessage({
+      toolCallId: 'call_empty_after',
+      isError: false,
+      content: [{ type: 'text', text: '' }],
+    }))
+    emitToolResult(handlers, session, liveMessage({
+      toolCallId: 'call_reasoning_after',
+      isError: false,
+      content: [{ type: 'reasoning', text: 'PRIVATE' }],
+    }))
+    assert.equal(transcriptLinesIfAny(env.root, session.id).length, 1,
+      'empty results must not append beside a real line')
+  } finally {
+    rmSync(env.root, { recursive: true, force: true })
+  }
+})

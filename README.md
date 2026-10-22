@@ -16,7 +16,8 @@ One ESM Cordis plugin (`lib/index.js`) that:
   (`agent/created` with `source: startup`; resume, clear and compact are skipped, and an omitted
   source is treated as startup);
 - captures pre-compaction state before summarization and re-injects authoritative post-compaction
-  context (the pending flag is cleared only after a successful `postcompact-inject`);
+  context (the pending flag is kept until a successful `postcompact-inject` has been delivered to
+  an entering step);
 - runs throttled **per-turn** extraction (`decision-extractor`, `handoff-generator`,
   `feedback-loop`) detached, never blocking the turn;
 - maintains a ClawMem-readable transcript per session;
@@ -310,12 +311,14 @@ the `dsh-web.service` unit sends to the systemd journal. The sink is filtered by
 
 Each mirrored message is written as one physical line, `[clawmem][<type>] <text>`, with CR and
 LF in the rendered text escaped to the two-character forms `\r` and `\n`; the rendered text is
-then truncated to 4,000 characters (the `STDERR_MAX_CHARS` constant and the truncation step in
-`createStderrExporter`'s `export()`, both in `lib/index.js`), so a field such as an untrusted
-session id can never forge a second journald line. Registration is an ordinary disposable (the `ctx.logger.exporter(...)` call
-inside `installLogExporter` in `lib/index.js`), so the exporter is removed on unload, and an absent,
-hostile or throwing `exporter()` API, or a broken `process.stderr`, can neither break activation nor
-a run (fail-open).
+truncated to 4,000 characters, and the `...[truncated]` marker (`STDERR_TRUNCATED`) is appended
+when truncation occurred, so a truncated line's body is 4,014 characters (the `STDERR_MAX_CHARS`
+and `STDERR_TRUNCATED` constants and the truncation step in `createStderrExporter`'s
+`export()`, both in `lib/index.js`). A field such as an untrusted session id therefore cannot
+forge a second journald line. Registration is an ordinary disposable (the
+`ctx.logger.exporter(...)` call inside `installLogExporter` in `lib/index.js`), so the exporter is
+removed on unload, and an absent, hostile or throwing `exporter()` API, or a broken
+`process.stderr`, can neither break activation nor a run (fail-open).
 
 ### Extraction scheduling
 

@@ -33,7 +33,7 @@
 //     fails loudly unless the operator accepts the loss through an explicit environment variable.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { homedir, hostname, tmpdir } from 'node:os'
 import { basename, dirname, join, relative, resolve } from 'node:path'
@@ -234,12 +234,34 @@ function identityOffenders(root, host) {
   return offenders
 }
 
-/** A throwaway copy of the tree (no .git, no node_modules), planted with a fixture. */
-function withLab(plant, host = HOST) {
+/**
+ * The fixture copy's entry filter. It must model the same entry kinds the publication walk
+ * skips, and it must refuse the non-regular ones BEFORE cpSync touches them: cpSync with a
+ * filter throws "ERR_INTERNAL_ASSERTION: Unreachable code" for a FIFO (measured on Node 24),
+ * so one untracked pipe made every withLab fixture crash (T-ADV6-04). lstat is the only
+ * correct probe: stat would follow a symlink, and the walk (like npm) never packs one.
+ */
+function copyableEntry(src) {
+  if (NEVER_PACKED_NAMES.has(basename(src)) || basename(src) === 'node_modules') return false
+  try {
+    const stats = lstatSync(src)
+    return stats.isFile() || stats.isDirectory() || stats.isSymbolicLink()
+  } catch {
+    // An unreadable entry is cpSync's to report; this filter decides entry KIND only.
+    return true
+  }
+}
+
+/**
+ * A throwaway copy of the tree (no .git, no node_modules), planted with a fixture.
+ * The source is a parameter so a test can prove the COPY itself is robust to the entry
+ * kinds a real tree can hold (T-ADV6-04's FIFO); it defaults to the repository root.
+ */
+function withLab(plant, host = HOST, source = ROOT) {
   const base = mkdtempSync(join(tmpdir(), 'dsh-pub-lab-'))
   try {
     const lab = join(base, 'tree')
-    cpSync(ROOT, lab, { recursive: true, filter: (src) => !['.git', 'node_modules'].includes(basename(src)) })
+    cpSync(source, lab, { recursive: true, filter: copyableEntry })
     plant(lab)
     return identityOffenders(lab, host)
   } finally {
@@ -304,6 +326,56 @@ test('T-F4 (c): the real ROOT scan is clean in this linked worktree', () => {
   // machine's gitdir; pre-fix the walk read it as a publication file and reported
   // the home directory inside it.
   assert.deepEqual(identityOffenders(ROOT, HOST), [], 'machine identity in a reachable file')
+})
+
+// T-ADV6-04: the fixture copy itself must model the same entry kinds the publication walk
+// skips. cpSync with a filter throws "ERR_INTERNAL_ASSERTION: Unreachable code" for a FIFO
+// (Node 24, measured), so a tree containing one - an untracked pipe beside the sources - made
+// every withLab/identityOffenders fixture crash even though the walk and npm pack handle it.
+// The filter must lstat the entry and refuse every non-regular kind (FIFO/socket/device)
+// BEFORE cpSync touches it, while a regular file beside it is still copied and reported.
+test('T-ADV6-04: a FIFO in the fixture source tree does not crash the copy and a regular neighbour is still reported', (t) => {
+  if (process.platform === 'win32') {
+    t.skip('mkfifo is POSIX-only')
+    return
+  }
+  const base = mkdtempSync(join(tmpdir(), 'dsh-pub-fifo-'))
+  try {
+    const source = join(base, 'source')
+    mkdirSync(source, { recursive: true })
+    const fifo = join(source, 'pipe')
+    const made = spawnSync('mkfifo', [fifo])
+    if (made.error) {
+      t.skip('mkfifo is unavailable: ' + made.error.message)
+      return
+    }
+    if (made.status !== 0) {
+      t.skip('mkfifo failed: ' + String(made.stderr || '').trim().slice(0, 200))
+      return
+    }
+    // REAL publication content planted beside the FIFO: it must reach the copy and be reported.
+    writeFileSync(join(source, 'regular-leak.md'), 'const p = ' + JSON.stringify(HOME) + ';' + String.fromCharCode(10))
+    // The publication walk itself already handles a FIFO (only the fixture COPY crashed);
+    // this control pins the walk's side of the requirement, so a future copy fix cannot
+    // hide a walk regression.
+    assert.doesNotThrow(() => identityOffenders(source, HOST), 'the walk itself must skip a FIFO')
+    assert.deepEqual(identityOffenders(source, HOST),
+      ['regular-leak.md: the content carries the home directory'],
+      'the walk reports the regular neighbour and never the FIFO')
+    let offenders
+    assert.doesNotThrow(() => {
+      offenders = withLab((lab) => {
+        assert.equal(existsSync(join(lab, 'regular-leak.md')), true,
+          'the regular neighbour must still be copied')
+        assert.equal(existsSync(join(lab, 'pipe')), false,
+          'a FIFO is never publication content and must not be copied')
+      }, HOST, source)
+    }, 'a FIFO in the source tree must not crash the fixture copy (cpSync ERR_INTERNAL_ASSERTION)')
+    assert.deepEqual(offenders, ['regular-leak.md: the content carries the home directory'],
+      'the regular neighbour must still be reported beside the skipped FIFO')
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+  }
 })
 
 test('the hostname rule is case-insensitive, word-bounded and has no off switch', () => {
