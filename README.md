@@ -16,8 +16,9 @@ One ESM Cordis plugin (`lib/index.js`) that:
   (`agent/created` with `source: startup`; resume, clear and compact are skipped, and an omitted
   source is treated as startup);
 - captures pre-compaction state before summarization and re-injects authoritative post-compaction
-  context (the pending flag is kept until a successful `postcompact-inject` has been delivered to
-  an entering step);
+  context (the pending flag is consumed only when an entering step has taken a successful
+  `postcompact-inject` run and delivered its context, if any; a step that does not enter, a failed
+  hook, or a failed injected-message build keeps the flag for the next step);
 - runs throttled **per-turn** extraction (`decision-extractor`, `handoff-generator`,
   `feedback-loop`) detached, never blocking the turn;
 - maintains a ClawMem-readable transcript per session;
@@ -99,8 +100,9 @@ To tell the two layers apart when a change seems not to take effect: the profile
 cd "$HOME/.dsh/plugins/dsh-clawmem" && node --test tests/*.test.mjs
 ```
 
-The runner prints the authoritative count on its `ℹ tests` line - read that line rather than
-trusting a number in prose (the suite targets Node 22 or newer). There is no CI wiring, so run this one-liner after any change. `tests/` is intentionally **not** part of the
+The runner prints the authoritative count on its `ℹ tests` line (the spec reporter) or its
+`# tests` line (Node 22's non-TTY TAP reporter) - read that reported count rather than trusting a
+number in prose (the suite targets Node 22 or newer). There is no CI wiring, so run this one-liner after any change. `tests/` is intentionally **not** part of the
 package (see `files` in `package.json`), so this command and the `npm test` script are for a source
 checkout; an installed copy carries no tests to run. `lib/index.js` also exports two internal seams -
 `unavailableClient` and `createHookClient` - used by the fallback path and its tests; they are not a
@@ -384,7 +386,9 @@ assistant `tool_use` and weaken the zero-duplicate-`tool_use_id` property. It is
 than the fingerprint window (one short id per tool call, against 64-character digests) but it
 is not bounded; it is dropped only when the manager closes (see Known limitations).
 Multi-block tool results are emitted in full, not just the first block. Excluded: system messages,
-plugin-injected user messages, reasoning blocks, and empty content lines.
+plugin-injected user messages, reasoning blocks, and empty content lines (a tool result that stores
+nothing - empty input, or a non-empty result truncated to nothing at `transcript.maxToolResultChars:
+0` - emits no line and records no de-duplication fingerprint).
 
 File-handle text comes from a single helper, `fileHandleText` in `lib/transcript.js`, shared by
 the assistant file block and the user file handle: `[file name="…" bytes=N

@@ -286,3 +286,200 @@ test('T-SEC8-1 (b): a rejected step keeps the empty-context hook pending, and th
     rmSync(env.root, { recursive: true, force: true })
   }
 })
+
+// ---- T-ADV7-01 (batch 10): concurrent pre-steps must not deliver twice ----------
+// state.bootstrap and state.postCompactPending were read synchronously but consumed
+// only after the awaited message build. Two agent/pre-step invocations overlapping on
+// one session therefore both captured the pending text: two copies of the bootstrap,
+// or two postcompact-inject spawns and two copies of its context. The fix captures and
+// clears the pending state BEFORE the awaits and restores it when the step does not
+// enter (or the injected message cannot be built). These tests pin the concurrent
+// boundary together with the sequential and retention behaviour that must survive it.
+function waitFor(predicate, timeoutMs) {
+  const limit = timeoutMs || 3000
+  const started = Date.now()
+  return new Promise((resolve, reject) => {
+    const poll = () => {
+      if (predicate()) return resolve()
+      if (Date.now() - started > limit) return reject(new Error('timed out waiting for the test premise'))
+      setTimeout(poll, 10)
+    }
+    poll()
+  })
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+test('T-ADV7-01 (a): two concurrent pre-steps with a pending bootstrap inject it exactly once', async () => {
+  const env = setup()
+  try {
+    const { ctx, handlers } = makeCtx()
+    const dispose = applyForPreStep(ctx, env, {
+      bootstrap: { sessionBootstrap: true, curatorNudge: false, stalenessCheck: false },
+    })
+    const session = { id: 'sess-concurrent-bootstrap', header: {} }
+    handlers.get('agent/created')[0].fn({ agent: { session }, source: 'startup' })
+    // The detached agent/created hook stores state.bootstrap; wait for its spawn and
+    // let the IIFE finish before the concurrent pair starts.
+    await waitFor(() => spawnCount(env, 'session-bootstrap') === 1)
+    await sleep(100)
+
+    let nextCalls = 0
+    const slowEnter = async () => { nextCalls += 1; await sleep(30); return enter() }
+    const [first, second] = await Promise.all([
+      preStep(handlers, session, 1, slowEnter),
+      preStep(handlers, session, 2, slowEnter),
+    ])
+    assert.equal(nextCalls, 2, 'both concurrent pre-steps still consult the downstream step')
+    assert.equal(first.kind, 'enter')
+    assert.equal(second.kind, 'enter')
+    const injected = [first, second].map(injectedText)
+    const copies = injected.join(LF).split(BOOTSTRAP_TEXT).length - 1
+    assert.equal(copies, 1,
+      'exactly one concurrent pre-step may inject the bootstrap; got ' + JSON.stringify(injected))
+    assert.equal(injected.filter((text) => text.includes('<vault-session>')).length, 1,
+      'one injected message carries <vault-session>, not two; got ' + JSON.stringify(injected))
+    assert.equal(spawnCount(env, 'session-bootstrap'), 1, 'the bootstrap hook is not re-spawned')
+
+    // Sequential delivery is unchanged: the pair consumed it, a later step repeats nothing.
+    const third = await preStep(handlers, session, 3, enter)
+    assert.equal(third.kind, 'enter')
+    assert.equal(injectedText(third).includes('<vault-session>'), false,
+      'a later sequential entering step must not repeat the bootstrap, got ' + JSON.stringify(injectedText(third)))
+    assert.equal(spawnCount(env, 'session-bootstrap'), 1)
+    dispose()
+  } finally {
+    rmSync(env.root, { recursive: true, force: true })
+  }
+})
+
+test('T-ADV7-01 (b): two concurrent pre-steps with a pending post-compaction context spawn and inject once', async () => {
+  const env = setup()
+  try {
+    const { ctx, handlers } = makeCtx()
+    const dispose = applyForPreStep(ctx, env, {
+      bootstrap: { sessionBootstrap: false, curatorNudge: false, stalenessCheck: false },
+    })
+    const session = { id: 'sess-concurrent-postcompact', header: {} }
+    handlers.get('session/event')[0].fn(session, { type: 'compaction/end', data: {} })
+
+    let nextCalls = 0
+    const slowEnter = async () => { nextCalls += 1; await sleep(30); return enter() }
+    const [first, second] = await Promise.all([
+      preStep(handlers, session, 1, slowEnter),
+      preStep(handlers, session, 2, slowEnter),
+    ])
+    assert.equal(nextCalls, 2, 'both concurrent pre-steps still consult the downstream step')
+    assert.equal(first.kind, 'enter')
+    assert.equal(second.kind, 'enter')
+    assert.equal(spawnCount(env, 'postcompact-inject'), 1,
+      'two concurrent pre-steps must spawn postcompact-inject once; spawned ' +
+      spawnCount(env, 'postcompact-inject'))
+    const injected = [first, second].map(injectedText)
+    const copies = injected.join(LF).split(POSTCOMPACT_TEXT).length - 1
+    assert.equal(copies, 1,
+      'exactly one concurrent pre-step may inject the post-compaction context; got ' + JSON.stringify(injected))
+    assert.equal(injected.filter((text) => text.includes('<vault-postcompact>')).length, 1)
+
+    // The entering pair consumed the successful run: sequential steps spawn nothing more.
+    const afterPair = spawnCount(env, 'postcompact-inject')
+    const third = await preStep(handlers, session, 3, enter)
+    assert.equal(third.kind, 'enter')
+    assert.equal(injectedText(third).includes(POSTCOMPACT_TEXT), false,
+      'the post-compaction context is delivered once, got ' + JSON.stringify(injectedText(third)))
+    assert.equal(spawnCount(env, 'postcompact-inject'), afterPair,
+      'the pending flag must be cleared by the entering concurrent pair')
+    dispose()
+  } finally {
+    rmSync(env.root, { recursive: true, force: true })
+  }
+})
+
+test('T-ADV7-01 (c): two concurrent rejected pre-steps retain the bootstrap for the next entering step', async () => {
+  const env = setup()
+  try {
+    const { ctx, handlers } = makeCtx()
+    const dispose = applyForPreStep(ctx, env, {
+      bootstrap: { sessionBootstrap: true, curatorNudge: false, stalenessCheck: false },
+    })
+    const session = { id: 'sess-concurrent-reject', header: {} }
+    handlers.get('agent/created')[0].fn({ agent: { session }, source: 'startup' })
+    await waitFor(() => spawnCount(env, 'session-bootstrap') === 1)
+    await sleep(100)
+
+    const reject = async () => { await sleep(30); return { kind: 'reject', reason: 'archived session gate' } }
+    const [first, second] = await Promise.all([
+      preStep(handlers, session, 1, reject),
+      preStep(handlers, session, 2, reject),
+    ])
+    assert.equal(first.kind, 'reject')
+    assert.equal(second.kind, 'reject')
+    for (const [label, result] of [['first', first], ['second', second]]) {
+      assert.equal(injectedText(result).includes('<vault-session>'), false,
+        label + ': a rejected step must not receive the bootstrap, got ' + JSON.stringify(injectedText(result)))
+    }
+    // A rejected/concurrent step may not consume the state (ADV6-01 retention).
+    const third = await preStep(handlers, session, 3, enter)
+    assert.match(injectedText(third), /<vault-session>BOOTSTRAP-TEXT<\/vault-session>/,
+      'the bootstrap must survive two concurrent rejects, got ' + JSON.stringify(injectedText(third)))
+    assert.equal(injectedText(third).split(BOOTSTRAP_TEXT).length - 1, 1)
+    assert.equal(spawnCount(env, 'session-bootstrap'), 1)
+
+    const fourth = await preStep(handlers, session, 4, enter)
+    assert.equal(injectedText(fourth).includes('<vault-session>'), false,
+      'the bootstrap is delivered exactly once after the rejects, got ' + JSON.stringify(injectedText(fourth)))
+    dispose()
+  } finally {
+    rmSync(env.root, { recursive: true, force: true })
+  }
+})
+
+test('T-ADV7-01 (d): an injection build failure retains the bootstrap for the next entering step', async () => {
+  const env = setup()
+  const previousHome = process.env.DSH_HOME
+  try {
+    const { ctx, handlers } = makeCtx()
+    const dispose = applyForPreStep(ctx, env, {
+      bootstrap: { sessionBootstrap: true, curatorNudge: false, stalenessCheck: false },
+    })
+    const session = { id: 'sess-build-failure', header: {} }
+    handlers.get('agent/created')[0].fn({ agent: { session }, source: 'startup' })
+    await waitFor(() => spawnCount(env, 'session-bootstrap') === 1)
+    await sleep(100)
+
+    // A DSH_HOME whose dsh-llm module throws on import makes userMessage() fail; the
+    // step must still enter without injecting, and keep the collected bootstrap.
+    const badHome = join(env.root, 'bad-dsh-home')
+    mkdirSync(join(badHome, 'profiles'), { recursive: true })
+    mkdirSync(join(badHome, 'node_modules', '@deepseek-ai', 'dsh-llm'), { recursive: true })
+    writeFileSync(join(badHome, 'profiles', 'noop.js'), '// build-failure anchor' + LF)
+    writeFileSync(join(badHome, 'node_modules', '@deepseek-ai', 'dsh-llm', 'package.json'),
+      JSON.stringify({ name: '@deepseek-ai/dsh-llm', type: 'module', main: 'index.js' }))
+    writeFileSync(join(badHome, 'node_modules', '@deepseek-ai', 'dsh-llm', 'index.js'),
+      'throw new Error("build boom")' + LF)
+    process.env.DSH_HOME = badHome
+    let failedStep
+    try { failedStep = await preStep(handlers, session, 1, enter) } finally {
+      if (previousHome === undefined) delete process.env.DSH_HOME
+      else process.env.DSH_HOME = previousHome
+    }
+    assert.equal(failedStep.kind, 'enter')
+    assert.equal(injectedText(failedStep).includes('<vault-session>'), false,
+      'a failed message build must not inject, got ' + JSON.stringify(injectedText(failedStep)))
+    assert.equal(spawnCount(env, 'session-bootstrap'), 1)
+
+    // Build failure is a retention path: the next entering step delivers it once.
+    const second = await preStep(handlers, session, 2, enter)
+    assert.equal(injectedText(second).split(BOOTSTRAP_TEXT).length - 1, 1,
+      'the bootstrap must survive the build failure, got ' + JSON.stringify(injectedText(second)))
+    const third = await preStep(handlers, session, 3, enter)
+    assert.equal(injectedText(third).includes('<vault-session>'), false,
+      'the bootstrap is delivered exactly once after the build failure, got ' + JSON.stringify(injectedText(third)))
+    assert.equal(spawnCount(env, 'session-bootstrap'), 1)
+    dispose()
+  } finally {
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+    rmSync(env.root, { recursive: true, force: true })
+  }
+})

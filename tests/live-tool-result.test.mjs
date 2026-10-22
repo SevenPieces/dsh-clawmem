@@ -19,6 +19,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, existsS
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply, inject } from '../lib/index.js'
+import { createTranscriptManager } from '../lib/transcript.js'
 
 const LF = String.fromCharCode(10)
 const SERVICE_NAMES = new Set(['systemPrompt', 'skills', 'sessionProjections', 'jobs', 'loader'])
@@ -369,6 +370,72 @@ test('T-ADV6-02 control: a non-empty live tool result still appends exactly one 
     }))
     assert.equal(transcriptLinesIfAny(env.root, session.id).length, 1,
       'empty results must not append beside a real line')
+
+    // T-ADV7-03 update: this batch-8 control is extended to the NEW invariant at the
+    // direct-append API - appendToolResult with empty content (or with a 0 cap that
+    // makes a non-empty result store as '') writes no line and records no dedupe
+    // fingerprint. The event-path skip above is no longer the only layer enforcing it.
+    const direct = createTranscriptManager({ dir: env.root })
+    const directWriter = direct.writerFor('sess-direct-empty')
+    directWriter.appendToolResult({ callId: 'call_empty_direct', content: '', isError: false })
+    assert.equal(transcriptLinesIfAny(env.root, 'sess-direct-empty').length, 0,
+      'appendToolResult with empty content must append no line')
+    assert.equal(direct.__dedupeStats('sess-direct-empty').fingerprints, 0,
+      'appendToolResult with empty content must record no dedupe fingerprint')
+  } finally {
+    rmSync(env.root, { recursive: true, force: true })
+  }
+})
+
+// --- T-ADV7-03 (batch 10): transcript.maxToolResultChars: 0 is documented as valid.
+//     A non-empty live tool result then stores as '', and the event path wrote a
+//     tool_result line with content:'' - the README excludes empty content lines.
+//     Required: no line at all. The library-level no-fingerprint half of the
+//     invariant is pinned by tests/transcript.test.mjs (T-ADV7-03); truncation > 0
+//     is pinned by the control below and by the pre-existing truncation tests.
+test('T-ADV7-03: a non-empty tool result with maxToolResultChars 0 appends no empty-content line', () => {
+  const env = setup()
+  try {
+    const { ctx, handlers } = makeCtx()
+    apply(ctx, {
+      clawmemBin: env.bin,
+      transcript: { dir: env.root, rotation: { enabled: false }, maxToolResultChars: 0 },
+    })
+    const session = { id: 'sess-zero-cap', header: {} }
+    const message = liveMessage({
+      toolCallId: 'call_zero',
+      isError: false,
+      content: [{ type: 'text', text: 'hello' }],
+    })
+    emitToolResult(handlers, session, message)
+    assert.equal(transcriptLinesIfAny(env.root, session.id).length, 0,
+      'a non-empty result truncated to empty must not append an empty-content line')
+    emitToolResult(handlers, session, message)
+    assert.equal(transcriptLinesIfAny(env.root, session.id).length, 0,
+      'the empty re-delivery must add nothing either')
+  } finally {
+    rmSync(env.root, { recursive: true, force: true })
+  }
+})
+
+test('T-ADV7-03 control: maxToolResultChars > 0 still writes the truncated line', () => {
+  const env = setup()
+  try {
+    const { ctx, handlers } = makeCtx()
+    apply(ctx, {
+      clawmemBin: env.bin,
+      transcript: { dir: env.root, rotation: { enabled: false }, maxToolResultChars: 1 },
+    })
+    const session = { id: 'sess-small-cap', header: {} }
+    emitToolResult(handlers, session, liveMessage({
+      toolCallId: 'call_small',
+      isError: false,
+      content: [{ type: 'text', text: 'hello' }],
+    }))
+    const lines = transcriptLinesIfAny(env.root, session.id)
+    assert.equal(lines.length, 1, 'a cap above 0 still writes exactly one line')
+    assert.equal(lines[0].message.content[0].content, 'h',
+      'the stored content is still the truncation of the result')
   } finally {
     rmSync(env.root, { recursive: true, force: true })
   }

@@ -1390,3 +1390,50 @@ test('T-ADV5-03 control: the 180-day fallback still removes a genuinely aged sto
     }
   }
 });
+
+// --- T-ADV7-03 (batch 10): appendToolResult must never write an EMPTY-CONTENT
+//     tool_result line. maxToolResultChars is documented as any non-negative
+//     number, and 0 truncates every result to ''. appendToolResult used to store
+//     that empty string (and its dedupe fingerprint); the README contract excludes
+//     empty content lines. Required: skip the line entirely and record no
+//     fingerprint, so a later real result for the same tool id is unaffected.
+//     Non-empty results and truncation > 0 are unchanged.
+test('T-ADV7-03: appendToolResult with empty content appends no line and records no dedupe fingerprint', async () => {
+  await withRoot((root) => {
+    const manager = createTranscriptManager({ dir: root });
+    const writer = manager.writerFor('s1');
+
+    writer.appendToolResult({ callId: 'empty-1', content: '', isError: false });
+    writer.appendToolResult({ callId: 'empty-1', content: '', isError: false });
+    assert.equal(existsSync(writer.path), false, 'an empty result must not create a transcript line');
+    const emptyStats = manager.__dedupeStats('s1');
+    assert.equal(emptyStats.callIds, 0, 'an empty result must not retain a tool_use_id');
+    assert.equal(emptyStats.fingerprints, 0, 'an empty result must not retain a dedupe fingerprint');
+
+    // The skip must not occupy the id: the first real result for it is appended.
+    writer.appendToolResult({ callId: 'empty-1', content: 'real output', isError: false });
+    const lines = readLines(writer.path);
+    assert.equal(lines.length, 1, 'a non-empty result still appends exactly one line');
+    assert.equal(lines[0].message.content[0].tool_use_id, 'empty-1');
+    assert.equal(lines[0].message.content[0].content, 'real output');
+    assert.equal(manager.__dedupeStats('s1').fingerprints, 1);
+
+    // maxToolResultChars: 0 makes a NON-empty result store as '' too: no line.
+    const zeroManager = createTranscriptManager({ dir: root, maxToolResultChars: 0 });
+    const zeroWriter = zeroManager.writerFor('s-zero');
+    zeroWriter.appendToolResult({ callId: 'zero', content: 'hello', isError: false });
+    assert.equal(existsSync(zeroWriter.path), false,
+      'maxToolResultChars 0 must not append an empty-content line');
+    assert.equal(zeroManager.__dedupeStats('s-zero').fingerprints, 0,
+      'maxToolResultChars 0 must not record a fingerprint for the skipped empty result');
+
+    // Truncation > 0 is unchanged: the stored line carries the truncated text.
+    const truncatedManager = createTranscriptManager({ dir: root, maxToolResultChars: 4 });
+    const truncatedWriter = truncatedManager.writerFor('s-trunc');
+    truncatedWriter.appendToolResult({ callId: 'trunc', content: 'abcdefgh', isError: false });
+    const truncated = readLines(truncatedWriter.path);
+    assert.equal(truncated.length, 1);
+    assert.deepEqual(truncated[0].message.content[0],
+      { type: 'tool_result', tool_use_id: 'trunc', content: 'abcd', is_error: false });
+  });
+});

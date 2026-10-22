@@ -106,9 +106,26 @@ function requireTool(t, label, probe, optOut) {
   assert.fail(label + ' is unavailable (' + detail + '), so this publication check cannot run; install it, or set ' + optOut + '=1 to accept the gap')
 }
 
+/**
+ * A path that disappeared between being listed and being read. This is a benign race
+ * (a concurrent clean, an editor, a helper); the entry has no bytes to scan. Every
+ * other filesystem error still fails the guard loudly - it must never hide a leak.
+ */
+function vanishedEntry(error) {
+  return Boolean(error) && (error.code === 'ENOENT' || error.code === 'ENOTDIR')
+}
+
 /** Every file the publication walk reaches under "root", minus the two private documents. */
 function shippedFiles(root, dir, acc) {
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+  let entries
+  try {
+    entries = readdirSync(dir, { withFileTypes: true })
+  } catch (error) {
+    // A directory can be removed between being listed and being walked (T-ADV7-02).
+    if (vanishedEntry(error)) return acc
+    throw error
+  }
+  for (const entry of entries) {
     const full = join(dir, entry.name)
     const rel = relative(root, full)
     // VCS metadata is skipped by NAME, whatever the entry type: a linked worktree stores .git as a
@@ -199,7 +216,16 @@ function decodings(buffer) {
 /** Why this file's bytes are an identity leak, if they are. The host is a parameter for the same reason. */
 function contentOffenders(file, host) {
   requireHost(host, 'contentOffenders')
-  const buffer = readFileSync(file)
+  let buffer
+  try {
+    buffer = readFileSync(file)
+  } catch (error) {
+    // T-ADV7-02: a file can vanish between the walk's readdir and this read. A
+    // vanished entry has no bytes to scan, so skip it; every other read error is
+    // still the guard's to report loudly (the guard never fails open on a leak).
+    if (vanishedEntry(error)) return []
+    throw error
+  }
   for (const raw of decodings(buffer)) {
     const text = raw.split('\\/').join('/')
     if (HOME && text.includes(HOME)) return ['the content carries the home directory']
@@ -376,6 +402,100 @@ test('T-ADV6-04: a FIFO in the fixture source tree does not crash the copy and a
   } finally {
     rmSync(base, { recursive: true, force: true })
   }
+})
+
+// T-ADV7-02: a file present in readdir's result can vanish before readFileSync (a
+// concurrent clean, an editor, a helper). The walk had no per-file read-error
+// handling, so the whole publication guard crashed with ENOENT. A vanished entry is
+// unavailable content: it must be skipped (a benign race, never a false green for the
+// entries that remain) while a planted regular home-path neighbour is still reported.
+// The race is deterministic through a child-process preload that unlinks the target
+// immediately after readdirSync returns for its directory. The mechanism is
+// POSIX/Node-only; elsewhere the test skips rather than passing vacuously.
+test('T-ADV7-02: a file that vanishes between the walk\'s readdir and its read does not crash the guard', (t) => {
+  if (process.platform === 'win32') {
+    t.skip('the child-process fs preload race is exercised on POSIX only')
+    return
+  }
+  const base = mkdtempSync(join(tmpdir(), 'dsh-pub-race-'))
+  try {
+    const lab = join(base, 'tree')
+    const raceDir = join(lab, 'lib', 'race')
+    mkdirSync(raceDir, { recursive: true })
+    const lf = String.fromCharCode(10)
+    writeFileSync(join(raceDir, 'target.txt'), 'vanishes' + lf)
+    // REAL publication content planted beside the vanishing entry: it must still be
+    // reported after the crash-prone read is skipped.
+    writeFileSync(join(lab, 'regular-leak.md'), 'const p = ' + JSON.stringify(HOME) + ';' + lf)
+
+    const preload = join(base, 'race-preload.cjs')
+    writeFileSync(preload, [
+      "const fs = require('node:fs')",
+      "const path = require('node:path')",
+      "const raceDir = path.resolve(process.env.PUB_RACE_DIR || '')",
+      'const marker = process.env.PUB_RACE_MARKER',
+      "const target = path.join(raceDir, 'target.txt')",
+      'const original = fs.readdirSync',
+      'fs.readdirSync = function (...args) {',
+      '  const result = original.apply(this, args)',
+      '  if (path.resolve(String(args[0])) === raceDir) {',
+      '    try {',
+      '      fs.unlinkSync(target)',
+      "      if (marker) fs.writeFileSync(marker, 'raced' + String.fromCharCode(10))",
+      '    } catch {}',
+      '  }',
+      '  return result',
+      '}',
+      '',
+    ].join(lf))
+
+    const marker = join(base, 'race.marker')
+    // The test runner exports NODE_TEST_CONTEXT to its workers; inheriting it makes a
+    // nested "node --test" refuse to run files (recursive run() warning). Drop it so
+    // the child is an ordinary test-runner process.
+    const childEnv = Object.assign({}, process.env, {
+      PUB_RACE_DIR: raceDir,
+      PUB_RACE_MARKER: marker,
+      PUB_RACE_ROOT: lab,
+    })
+    delete childEnv.NODE_TEST_CONTEXT
+    const child = spawnSync(process.execPath, [
+      '--require', preload,
+      '--test',
+      '--test-name-pattern', 'T-ADV7-02 child',
+      fileURLToPath(import.meta.url),
+    ], {
+      encoding: 'utf8',
+      timeout: 30000,
+      env: childEnv,
+    })
+    assert.equal(existsSync(marker), true,
+      'the race must actually happen (the preload deletes target.txt after readdir); ' +
+      'stdout=' + String(child.stdout) + ' stderr=' + String(child.stderr))
+    assert.equal(child.status, 0,
+      'the guard must skip a vanished entry instead of crashing; ' +
+      'stdout=' + String(child.stdout) + ' stderr=' + String(child.stderr))
+    assert.equal(child.signal, null, 'the child must finish on its own (no timeout kill)')
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+// Driven only by the parent above through --test-name-pattern; in a normal suite run
+// it is skipped so it can never scan the real tree without the race preload.
+test('T-ADV7-02 child: a vanished walk entry is skipped and the regular neighbour is still reported', (t) => {
+  const root = process.env.PUB_RACE_ROOT
+  if (!root) {
+    t.skip('driven by the T-ADV7-02 parent test through a child-process preload')
+    return
+  }
+  let offenders
+  assert.doesNotThrow(() => { offenders = identityOffenders(root, HOST) },
+    'a file removed between readdir and read must not crash the publication walk')
+  assert.equal(existsSync(process.env.PUB_RACE_MARKER), true,
+    'the race preload must have unlinked target.txt after readdir')
+  assert.ok(offenders.includes('regular-leak.md: the content carries the home directory'),
+    'the planted regular home-path neighbour must still be reported, got ' + JSON.stringify(offenders))
 })
 
 test('the hostname rule is case-insensitive, word-bounded and has no off switch', () => {
