@@ -303,8 +303,9 @@ test('T-ADV5-04 control: a bare top-level string block is still kept', () => {
 //     "reasoning blocks, and empty content lines", and appendUser enforces the same
 //     invariant; the tool-result path only filtered falsy mapped blocks, so a
 //     reasoning-only or empty-text result still appended a tool_result with
-//     content:''. An empty mapped result is not transcript content, even though its
-//     dedupe state may still be recorded.
+//     content:''. An empty mapped result is not transcript content: the skip happens
+//     before appendToolResult, so nothing is appended and no dedupe fingerprint is
+//     recorded.
 function transcriptLinesIfAny(root, sessionId) {
   const path = join(root, sessionId, 'transcript.jsonl')
   if (!existsSync(path)) return []

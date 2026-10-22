@@ -13,6 +13,16 @@
 // on the startup announcement and the post-compaction context is re-injected. The
 // required behaviour: clear the state only after an ENTERING step actually carries the
 // parts; a rejected step changes nothing.
+//
+// T-SEC8-1: "carries the parts" cannot mean "parts.length > 0": the installed
+// ClawMem hook returns ok with an EMPTY additionalContext when it has nothing to
+// inject (empty/reasoning output is excluded upstream), so the successful run can
+// legitimately contribute no message. The ADV6-01 retention fix only cleared the
+// flag on the non-empty-parts path, so an ok-empty run was re-spawned on every
+// later pre-step (security step 8 measured 5 invocations for 5 entering steps vs 1
+// at b5123a7). Required: a step that ENTERS consumes a successful (even empty)
+// postcompact run; a rejected step still keeps it pending, and the next entering
+// step runs the hook once and then clears it.
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, existsSync, rmSync } from 'node:fs'
@@ -52,7 +62,7 @@ function makeCtx() {
   return { ctx, handlers }
 }
 
-function setup() {
+function setup(options) {
   const root = mkdtempSync(join(tmpdir(), 'clawmem-prestep-loss-'))
   const pkg = join(root, 'pkg')
   const binDir = join(pkg, 'bin')
@@ -61,21 +71,27 @@ function setup() {
   const logPath = join(root, 'hooks.log')
   // Each hook returns a distinct context; the bootstrap and post-compaction markers
   // name the state under test so a lost delivery cannot hide behind another part.
+  // A hook mapped to '' returns ok with NO additionalContext (the T-SEC8-1 trigger,
+  // matching the upstream hook's empty output); that must stay distinct from the
+  // unlisted-hook 'CTX-<hook>' fallback, so '' is honoured rather than treated as
+  // absent.
+  const hookContexts = Object.assign({
+    'session-bootstrap': BOOTSTRAP_TEXT,
+    'curator-nudge': 'CTX-curator-nudge',
+    'staleness-check': 'CTX-staleness-check',
+    'postcompact-inject': POSTCOMPACT_TEXT,
+    'context-surfacing': 'CTX-context-surfacing',
+  }, (options && options.hookContexts) || {})
   writeFileSync(bin, [
     '#!/usr/bin/env node',
     "import { appendFileSync } from 'node:fs'",
     'const hook = process.argv[3]',
     'const log = process.env.DSH_TEST_LOG',
     'if (log) appendFileSync(log, hook + String.fromCharCode(10))',
-    'const contexts = {',
-    "  'session-bootstrap': " + JSON.stringify(BOOTSTRAP_TEXT) + ",",
-    "  'curator-nudge': 'CTX-curator-nudge',",
-    "  'staleness-check': 'CTX-staleness-check',",
-    "  'postcompact-inject': " + JSON.stringify(POSTCOMPACT_TEXT) + ",",
-    "  'context-surfacing': 'CTX-context-surfacing',",
-    '}',
-    "const context = contexts[hook] || ('CTX-' + hook)",
-    'process.stdout.write(JSON.stringify({ continue: true, hookSpecificOutput: { additionalContext: context } }))',
+    'const contexts = ' + JSON.stringify(hookContexts),
+    'const listed = Object.prototype.hasOwnProperty.call(contexts, hook)',
+    "const context = listed ? contexts[hook] : ('CTX-' + hook)",
+    'process.stdout.write(JSON.stringify({ continue: true, hookSpecificOutput: context ? { additionalContext: context } : {} }))',
     '',
   ].join(LF))
   chmodSync(bin, 0o755)
@@ -182,6 +198,89 @@ test('T-ADV6-01 (b): a rejected step keeps the pending post-compaction context f
       'the post-compaction context is delivered once, got ' + JSON.stringify(injectedText(third)))
     assert.equal(spawnCount(env, 'postcompact-inject'), afterDelivery,
       'no post-compaction hook runs after the pending flag is cleared')
+    dispose()
+  } finally {
+    rmSync(env.root, { recursive: true, force: true })
+  }
+})
+
+// ---- T-SEC8-1 (security step 8, introduced by the ADV6-01 fix) ----------------
+// An ok postcompact-inject with an EMPTY additionalContext is a realistic run: the
+// upstream hook returns makeEmptyOutput when it has nothing to inject. Such a run
+// contributes no message, so the ADV6-01 clear path (parts.length > 0) was never
+// reached and the flag stayed pending forever: every later entering pre-step ran
+// the hook again. These two tests pin the required boundary:
+//   (a) the first step that ENTERS consumes the successful (empty) run, so the
+//       second entering step spawns no further hook; and
+//   (b) ADV6-01 retention still wins over the reject decision: a rejected step
+//       keeps the pending state, the next entering step runs the hook exactly once
+//       more and then clears it.
+test('T-SEC8-1 (a): an ok post-compaction hook with empty context runs once, not on every entering step', async () => {
+  const env = setup({ hookContexts: { 'postcompact-inject': '' } })
+  try {
+    const { ctx, handlers } = makeCtx()
+    // Isolate the post-compaction state: no bootstrap hooks are enabled for this session.
+    const dispose = applyForPreStep(ctx, env, {
+      bootstrap: { sessionBootstrap: false, curatorNudge: false, stalenessCheck: false },
+    })
+    const session = { id: 'sess-sec8-empty-enter', header: {} }
+    handlers.get('session/event')[0].fn(session, { type: 'compaction/end', data: {} })
+
+    // The first step enters; the hook returns ok with no context, so it adds no
+    // message but the step still enters and the successful run was delivered.
+    const first = await preStep(handlers, session, 1, enter)
+    assert.equal(first.kind, 'enter')
+    assert.equal(injectedText(first).includes('<vault-postcompact>'), false,
+      'an empty context contributes no message, got ' + JSON.stringify(injectedText(first)))
+    assert.equal(spawnCount(env, 'postcompact-inject'), 1,
+      'the first entering step runs the authoritative-context hook once')
+
+    // Entering consumed the (empty) run: the second entering step must not spawn
+    // postcompact-inject again.
+    const second = await preStep(handlers, session, 2, enter)
+    assert.equal(second.kind, 'enter')
+    assert.equal(spawnCount(env, 'postcompact-inject'), 1,
+      'an entering step must clear the pending flag even when the hook returned no context; ' +
+      'the second entering step must not spawn postcompact-inject again (spawns: ' +
+      spawnCount(env, 'postcompact-inject') + ')')
+    dispose()
+  } finally {
+    rmSync(env.root, { recursive: true, force: true })
+  }
+})
+
+test('T-SEC8-1 (b): a rejected step keeps the empty-context hook pending, and the next entering step runs it once and clears it', async () => {
+  const env = setup({ hookContexts: { 'postcompact-inject': '' } })
+  try {
+    const { ctx, handlers } = makeCtx()
+    const dispose = applyForPreStep(ctx, env, {
+      bootstrap: { sessionBootstrap: false, curatorNudge: false, stalenessCheck: false },
+    })
+    const session = { id: 'sess-sec8-empty-reject', header: {} }
+    handlers.get('session/event')[0].fn(session, { type: 'compaction/end', data: {} })
+
+    // ADV6-01 retention with an empty-context hook: the reject decision must not
+    // consume the pending state, even though the hook itself succeeded.
+    const first = await preStep(handlers, session, 1, async () => ({ kind: 'reject', reason: 'busy' }))
+    assert.equal(first.kind, 'reject')
+    assert.equal((first.messages || []).length, 0, 'a rejected step receives nothing')
+    assert.equal(spawnCount(env, 'postcompact-inject'), 1,
+      'a rejected step still runs the authoritative-context hook')
+
+    // The next entering step runs the hook once more (the reject kept it pending)
+    // and, because that run is then delivered (even as "nothing"), clears it.
+    const second = await preStep(handlers, session, 2, enter)
+    assert.equal(second.kind, 'enter')
+    assert.equal(injectedText(second).includes('<vault-postcompact>'), false,
+      'the empty context contributes no message')
+    assert.equal(spawnCount(env, 'postcompact-inject'), 2,
+      'the pending flag must survive the reject: the entering step runs the hook once more')
+
+    const third = await preStep(handlers, session, 3, enter)
+    assert.equal(third.kind, 'enter')
+    assert.equal(spawnCount(env, 'postcompact-inject'), 2,
+      'the entering step must clear the pending flag after the ok-empty run; a later entering ' +
+      'step must not spawn the hook again (spawns: ' + spawnCount(env, 'postcompact-inject') + ')')
     dispose()
   } finally {
     rmSync(env.root, { recursive: true, force: true })
