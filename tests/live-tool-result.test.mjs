@@ -440,3 +440,96 @@ test('T-ADV7-03 control: maxToolResultChars > 0 still writes the truncated line'
     rmSync(env.root, { recursive: true, force: true })
   }
 })
+
+// --- T-ADV8-03 (batch 11): a malformed message-level toolCallId (null or
+//     object) must not leak into the transcript as tool_use_id:null, and an
+//     object must not be de-duplicated by reference identity. Only a string is a
+//     correlation identity; a live DSH host always sends a branded string, so
+//     this is the non-conforming-host / direct-API robustness path.
+test('T-ADV8-03: a live v4 object message-level toolCallId omits tool_use_id and is not de-duped by reference identity', () => {
+  const env = setup()
+  try {
+    const { ctx, handlers } = makeCtx()
+    apply(ctx, { clawmemBin: env.bin, transcript: { dir: env.root, rotation: { enabled: false } } })
+    const session = { id: 'sess-adv8-object', header: {} }
+    const toolCallId = { k: 1 }
+    const message = liveMessage({
+      toolCallId,
+      isError: false,
+      content: [{ type: 'text', text: 'object id result' }],
+    })
+
+    emitToolResult(handlers, session, message)
+    emitToolResult(handlers, session, message)
+
+    const lines = readTranscript(env.root, session.id)
+    assert.equal(lines.length, 2, 'an object toolCallId must not be de-duped by reference identity')
+    for (const line of lines) {
+      assert.deepEqual(line.message.content[0],
+        { type: 'tool_result', content: 'object id result', is_error: false })
+      assert.equal(Object.hasOwn(line.message.content[0], 'tool_use_id'), false,
+        'an object toolCallId must not be written as tool_use_id')
+    }
+  } finally {
+    rmSync(env.root, { recursive: true, force: true })
+  }
+})
+
+test('T-ADV8-03: a live v4 null message-level toolCallId omits tool_use_id (never JSON null)', () => {
+  const env = setup()
+  try {
+    const { ctx, handlers } = makeCtx()
+    apply(ctx, { clawmemBin: env.bin, transcript: { dir: env.root, rotation: { enabled: false } } })
+    const session = { id: 'sess-adv8-null', header: {} }
+    const message = liveMessage({
+      toolCallId: null,
+      isError: false,
+      content: [{ type: 'text', text: 'null id result' }],
+    })
+
+    emitToolResult(handlers, session, message)
+    emitToolResult(handlers, session, message)
+
+    const lines = readTranscript(env.root, session.id)
+    assert.equal(lines.length, 2, 'without an id there is no identity to de-duplicate')
+    for (const line of lines) {
+      assert.deepEqual(line.message.content[0],
+        { type: 'tool_result', content: 'null id result', is_error: false })
+      assert.equal(Object.hasOwn(line.message.content[0], 'tool_use_id'), false,
+        'a null toolCallId must not be written as tool_use_id:null')
+    }
+  } finally {
+    rmSync(env.root, { recursive: true, force: true })
+  }
+})
+
+test('T-ADV8-03 control: a live v4 string message-level toolCallId still de-dupes exactly', () => {
+  const env = setup()
+  try {
+    const { ctx, handlers } = makeCtx()
+    apply(ctx, { clawmemBin: env.bin, transcript: { dir: env.root, rotation: { enabled: false } } })
+    const session = { id: 'sess-adv8-string', header: {} }
+    const message = liveMessage({
+      toolCallId: 'call_string',
+      isError: false,
+      content: [{ type: 'text', text: 'same result' }],
+    })
+
+    emitToolResult(handlers, session, message)
+    emitToolResult(handlers, session, message)
+    emitToolResult(handlers, session, liveMessage({
+      toolCallId: 'call_string',
+      isError: false,
+      content: [{ type: 'text', text: 'different result' }],
+    }))
+
+    const lines = readTranscript(env.root, session.id)
+    assert.equal(lines.length, 2, 'an identical string re-delivery is dropped, different content is kept')
+    assert.deepEqual(lines[0].message.content[0],
+      { type: 'tool_result', tool_use_id: 'call_string', content: 'same result', is_error: false })
+    assert.deepEqual(lines[1].message.content[0],
+      { type: 'tool_result', tool_use_id: 'call_string', content: 'different result', is_error: false })
+  } finally {
+    rmSync(env.root, { recursive: true, force: true })
+  }
+})

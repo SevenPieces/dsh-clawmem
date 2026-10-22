@@ -373,7 +373,11 @@ name/size plus the `{"file_path":...}` form when the block exposes a path), a sy
 **assistant** `tool_use` line for a `tool/call` that no assistant message carried
 (de-duplicated by `callId`), and `tool_result` lines (content truncated to
 `transcript.maxToolResultChars`, default 500) whose identical re-delivery for the same
-`tool_use_id` is dropped. That de-duplication compares the **full** untruncated result text
+`tool_use_id` is dropped. De-duplication is keyed by **non-empty string** ids only: a
+`tool_use_id`/`callId` that is absent, empty or not a string (a malformed host event) writes the
+line without the `tool_use_id` (and a synthesized `tool_use` without `id`) and is never
+de-duplicated - a result never carries `"tool_use_id": null`, and a synthesized `tool_use` never
+carries a non-string `id`. That de-duplication compares the **full** untruncated result text
 plus `is_error`, stored as a SHA-256 hex digest per result, so a result that differs from an
 earlier one only past the truncation point (or only in `is_error`) is appended rather than
 silently dropped. The per-session de-duplication memory is a bounded FIFO window of the 2,048
@@ -385,7 +389,10 @@ never evicted, because capping it would allow an old callId to re-emit a synthes
 assistant `tool_use` and weaken the zero-duplicate-`tool_use_id` property. It is far lighter
 than the fingerprint window (one short id per tool call, against 64-character digests) but it
 is not bounded; it is dropped only when the manager closes (see Known limitations).
-Multi-block tool results are emitted in full, not just the first block. Excluded: system messages,
+Multi-block tool results are emitted in full, not just the first block. A line that fails to
+write (the failure is logged and swallowed) records no de-duplication state, so the host's
+re-delivery after a transient write failure is stored instead of being silently dropped.
+Excluded: system messages,
 plugin-injected user messages, reasoning blocks, and empty content lines (a tool result that stores
 nothing - empty input, or a non-empty result truncated to nothing at `transcript.maxToolResultChars:
 0` - emits no line and records no de-duplication fingerprint).
@@ -403,7 +410,8 @@ than `transcript.rotation.maxAgeDays` (default 180) every
 also runs **at activation**, before that interval is armed, so a process restarted more often than
 `transcript.rotation.sweepIntervalHours` still prunes. Disabling rotation
 (`transcript.rotation.enabled: false`) stops all pruning. Write and rotation failures are logged,
-never thrown.
+never thrown; a session directory that disappears between the listing and its stat/removal is
+skipped silently, since it was already gone rather than failing to rotate.
 
 Deletion is narrowly scoped: an aged session directory is removed recursively **only** when its
 entire inventory is this plugin's own session store - nothing at all (an empty directory), and/or

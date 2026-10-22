@@ -14,6 +14,7 @@ import {
   constants as fsConstants,
   symlinkSync,
   utimesSync,
+  chmodSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -1435,5 +1436,334 @@ test('T-ADV7-03: appendToolResult with empty content appends no line and records
     assert.equal(truncated.length, 1);
     assert.deepEqual(truncated[0].message.content[0],
       { type: 'tool_result', tool_use_id: 'trunc', content: 'abcd', is_error: false });
+  });
+});
+
+// --- T-ADV8-01: a transient write failure must not poison de-dupe. ---
+//
+// A failed append stores nothing but currently records the de-dupe identity
+// BEFORE the write, so the next identical re-delivery is silently dropped even
+// though no line ever reached the transcript. A transient EACCES on the session
+// dir is the cheap deterministic reproduction (write permission on the dir
+// controls creating the transcript file).
+
+const CHMOD_DENIAL_SKIP = (() => {
+  if (process.platform === 'win32') return 'POSIX mode bits are not available on win32';
+  if (typeof process.getuid === 'function' && process.getuid() === 0) {
+    return 'running as root: a 0500 directory does not deny writes';
+  }
+  return false;
+})();
+
+function chmodDeniesWrites(dir) {
+  const probe = join(dir, 'write-probe.tmp');
+  try {
+    writeFileSync(probe, 'probe');
+    rmSync(probe, { force: true });
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+test('T-ADV8-01: a failed tool-result write does not poison de-dupe - the recovered retry is stored',
+  { skip: CHMOD_DENIAL_SKIP }, () => {
+    const root = tmpRoot();
+    try {
+      const { logger, calls } = makeLogger();
+      const manager = createTranscriptManager({ dir: root, logger });
+      const writer = manager.writerFor('s1');
+      const dir = join(root, 's1');
+
+      chmodSync(dir, 0o500);
+      try {
+        assert.equal(chmodDeniesWrites(dir), true, 'premise: a 0500 session dir denies file creation');
+        writer.appendToolResult({ callId: 'r1', content: 'first content', isError: false });
+        assert.equal(existsSync(writer.path), false, 'premise: the failed attempt stored no line');
+        assert.equal(calls.filter((c) => c.level === 'warn').length, 1,
+          'the failed attempt must warn, got: ' + JSON.stringify(calls));
+      } finally {
+        chmodSync(dir, 0o700);
+      }
+
+      // The host re-delivers the same tool result after the transient failure.
+      writer.appendToolResult({ callId: 'r1', content: 'first content', isError: false });
+      assert.ok(existsSync(writer.path),
+        'the recovered retry must be stored: the failed attempt must not occupy the de-dupe window');
+      const lines = readLines(writer.path);
+      assert.equal(lines.length, 1);
+      assert.deepEqual(lines[0].message.content[0],
+        { type: 'tool_result', tool_use_id: 'r1', content: 'first content', is_error: false });
+
+      // A successful duplicate is still de-duplicated.
+      writer.appendToolResult({ callId: 'r1', content: 'first content', isError: false });
+      assert.equal(readLines(writer.path).length, 1, 'a successful identical re-delivery is still de-duped');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+test('T-ADV8-01: a failed synthesized tool-call write does not poison de-dupe - the recovered retry is stored',
+  { skip: CHMOD_DENIAL_SKIP }, () => {
+    const root = tmpRoot();
+    try {
+      const { logger, calls } = makeLogger();
+      const manager = createTranscriptManager({ dir: root, logger });
+      const writer = manager.writerFor('s2');
+      const dir = join(root, 's2');
+
+      chmodSync(dir, 0o500);
+      try {
+        assert.equal(chmodDeniesWrites(dir), true, 'premise: a 0500 session dir denies file creation');
+        writer.appendToolCall({ callId: 'call-1', name: 'read', arguments: '{"file_path":"/a"}' });
+        assert.equal(existsSync(writer.path), false, 'premise: the failed attempt stored no line');
+        assert.equal(calls.filter((c) => c.level === 'warn').length, 1,
+          'the failed attempt must warn, got: ' + JSON.stringify(calls));
+      } finally {
+        chmodSync(dir, 0o700);
+      }
+
+      writer.appendToolCall({ callId: 'call-1', name: 'read', arguments: '{"file_path":"/a"}' });
+      assert.ok(existsSync(writer.path),
+        'the recovered retry must be stored: the failed attempt must not occupy the de-dupe set');
+      const lines = readLines(writer.path);
+      assert.equal(lines.length, 1);
+      assert.deepEqual(lines[0].message.content,
+        [{ type: 'tool_use', id: 'call-1', name: 'read', input: { file_path: '/a' } }]);
+
+      writer.appendToolCall({ callId: 'call-1', name: 'read', arguments: '{"file_path":"/a"}' });
+      assert.equal(readLines(writer.path).length, 1, 'a successful identical re-delivery is still de-duped');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+// The same invariant covers a failed ASSISTANT line that carried a tool_use:
+// the id must not be registered when the line never reached the transcript, or
+// the later synthesized tool/call for that id is dropped as "already seen".
+
+test('T-ADV8-01: a failed assistant-message write does not poison the synthesized tool-call de-dupe',
+  { skip: CHMOD_DENIAL_SKIP }, () => {
+    const root = tmpRoot();
+    try {
+      const { logger, calls } = makeLogger();
+      const manager = createTranscriptManager({ dir: root, logger });
+      const writer = manager.writerFor('s3');
+      const dir = join(root, 's3');
+
+      chmodSync(dir, 0o500);
+      try {
+        assert.equal(chmodDeniesWrites(dir), true, 'premise: a 0500 session dir denies file creation');
+        writer.appendAssistant([{ type: 'tool-call', id: 'c9', name: 'read', arguments: '{}' }]);
+        assert.equal(existsSync(writer.path), false, 'premise: the failed attempt stored no line');
+        assert.equal(calls.filter((c) => c.level === 'warn').length, 1,
+          'the failed attempt must warn, got: ' + JSON.stringify(calls));
+      } finally {
+        chmodSync(dir, 0o700);
+      }
+
+      writer.appendToolCall({ callId: 'c9', name: 'read', arguments: '{}' });
+      assert.ok(existsSync(writer.path),
+        'the synthesized tool_use must be stored: the failed assistant line must not mark c9 as seen');
+      assert.deepEqual(readLines(writer.path).map((line) => line.message.content[0]),
+        [{ type: 'tool_use', id: 'c9', name: 'read', input: {} }]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+// --- T-ADV8-02: a session dir removed between the base listing and its stat
+// is a benign race (it is gone - nothing to keep, nothing to delete); a genuine
+// per-entry EACCES is still an error and still warns. ---
+//
+// The race is made deterministic by a child preload that wraps node:fs: after
+// the base readdirSync returns it removes one listed session dir, and it makes
+// lstatSync throw EACCES for another one.
+
+test('T-ADV8-02: a vanished session dir is silent; a per-entry EACCES still counts and warns', () => {
+  const host = tmpRoot();
+  const base = join(host, 'transcripts');
+  const vanishing = join(base, 'vanishing');
+  const denied = join(base, 'denied');
+  const removedOk = join(base, 'removed-ok');
+  const fresh = join(base, 'fresh');
+  try {
+    for (const dir of [vanishing, denied, removedOk, fresh]) {
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'transcript.jsonl'), '{"session":true}' + LF);
+    }
+    const old = new Date(Date.now() - 400 * DAY_MS);
+    for (const dir of [vanishing, denied, removedOk]) {
+      utimesSync(join(dir, 'transcript.jsonl'), old, old);
+      utimesSync(dir, old, old);
+    }
+
+    const libUrl = new URL('../lib/transcript.js', import.meta.url).href;
+    const preload = join(host, 'adv8-preload.cjs');
+    writeFileSync(preload, [
+      "const fs = require('node:fs');",
+      'const base = process.env.ADV8_BASE;',
+      'const vanishing = process.env.ADV8_VANISHING;',
+      'const denied = process.env.ADV8_DENIED;',
+      'const realReaddir = fs.readdirSync;',
+      'const realLstat = fs.lstatSync;',
+      'let armed = true;',
+      'fs.readdirSync = function (target, options) {',
+      '  const result = realReaddir.call(fs, target, options);',
+      '  if (armed && String(target) === base) {',
+      '    armed = false;',
+      '    fs.rmSync(vanishing, { recursive: true, force: true });',
+      '  }',
+      '  return result;',
+      '};',
+      'fs.lstatSync = function (target) {',
+      '  if (String(target) === denied) {',
+      "    const error = new Error('EACCES: permission denied, lstat ' + denied);",
+      "    error.code = 'EACCES';",
+      '    throw error;',
+      '  }',
+      '  return realLstat.apply(fs, arguments);',
+      '};',
+    ].join(LF));
+
+    const runner = join(host, 'adv8-sweep-runner.mjs');
+    writeFileSync(runner, [
+      "import { existsSync } from 'node:fs';",
+      'const { createTranscriptManager } = await import(' + JSON.stringify(libUrl) + ');',
+      'const warns = [];',
+      'const logger = {',
+      '  warn: (message, meta) => warns.push({ level: "warn", message, meta }),',
+      '  info: () => {},',
+      '  debug: () => {},',
+      '  error: () => {},',
+      '};',
+      'const summary = createTranscriptManager({',
+      '  dir: ' + JSON.stringify(base) + ',',
+      '  rotation: { enabled: true, maxAgeDays: 180, sweepIntervalHours: 24 },',
+      '  logger,',
+      '}).sweep();',
+      'process.stdout.write(JSON.stringify({',
+      '  summary,',
+      '  warns,',
+      '  deniedExists: existsSync(' + JSON.stringify(denied) + '),',
+      '  removedOkExists: existsSync(' + JSON.stringify(removedOk) + '),',
+      '  freshExists: existsSync(' + JSON.stringify(fresh) + '),',
+      '  vanishingExists: existsSync(' + JSON.stringify(vanishing) + '),',
+      '}));',
+    ].join(LF));
+
+    const child = spawnSync(process.execPath, ['--require', preload, runner], {
+      encoding: 'utf8',
+      timeout: 10000,
+      env: Object.assign({}, process.env, {
+        ADV8_BASE: base,
+        ADV8_VANISHING: vanishing,
+        ADV8_DENIED: denied,
+      }),
+    });
+    assert.equal(child.status, 0, 'the sweep runner must exit cleanly: ' + JSON.stringify(child.stderr));
+    const observed = JSON.parse(child.stdout);
+
+    assert.equal(observed.summary.errors, 1,
+      'only the EACCES entry is an error (the vanished dir is a benign race), got ' + JSON.stringify(observed));
+    assert.equal(observed.summary.removed, 1, 'the aged owned control store is still removed');
+    assert.equal(observed.warns.length, 1,
+      'exactly one warn (the EACCES entry), got ' + JSON.stringify(observed.warns));
+    assert.equal(observed.warns[0].meta && observed.warns[0].meta.session, 'denied',
+      'the one warn names the EACCES entry: ' + JSON.stringify(observed.warns));
+    assert.equal(observed.deniedExists, true, 'the EACCES dir is kept, never deleted');
+    assert.equal(observed.removedOkExists, false, 'the aged owned control store is removed');
+    assert.equal(observed.freshExists, true, 'a fresh store is kept');
+    assert.equal(observed.vanishingExists, false, 'premise: the dir vanished between the listing and its stat');
+  } finally {
+    rmSync(host, { recursive: true, force: true });
+  }
+});
+
+// --- T-ADV8-03: only STRING callIds are de-duplication identities. ---
+//
+// A malformed host (or the documented direct manager API) can hand over null,
+// undefined or an object as the tool-call id. Such an id must never be written
+// as tool_use_id (a JSON null is not a usable correlation id), and an object
+// must not be compared by reference: there is no stable identity to de-dupe, so
+// every delivered result/call is stored. String ids keep exact de-duplication.
+
+test('T-ADV8-03: null and undefined tool-result callIds omit tool_use_id', async () => {
+  await withRoot((root) => {
+    const manager = createTranscriptManager({ dir: root });
+    const writer = manager.writerFor('s1');
+
+    writer.appendToolResult({ callId: null, content: 'null id', isError: false });
+    writer.appendToolResult({ callId: undefined, content: 'undefined id', isError: false });
+    writer.appendToolResult({ callId: null, content: 'null id', isError: false });
+
+    const blocks = readLines(writer.path).map((line) => line.message.content[0]);
+    assert.equal(blocks.length, 3, 'without an id there is no identity to de-duplicate');
+    assert.deepEqual(blocks[0], { type: 'tool_result', content: 'null id', is_error: false });
+    assert.deepEqual(blocks[1], { type: 'tool_result', content: 'undefined id', is_error: false });
+    assert.deepEqual(blocks[2], { type: 'tool_result', content: 'null id', is_error: false });
+    assert.equal(Object.hasOwn(blocks[0], 'tool_use_id'), false, 'a null id must not be written as tool_use_id');
+    assert.equal(Object.hasOwn(blocks[1], 'tool_use_id'), false, 'an undefined id must not be written as tool_use_id');
+  });
+});
+
+test('T-ADV8-03: an object tool-result callId omits tool_use_id and is not de-duped by reference identity', async () => {
+  await withRoot((root) => {
+    const manager = createTranscriptManager({ dir: root });
+    const writer = manager.writerFor('s1');
+    const callId = { k: 1 };
+
+    writer.appendToolResult({ callId, content: 'object result', isError: false });
+    writer.appendToolResult({ callId, content: 'object result', isError: false });
+
+    const blocks = readLines(writer.path).map((line) => line.message.content[0]);
+    assert.equal(blocks.length, 2, 'an object id must not be de-duped by reference identity');
+    for (const block of blocks) {
+      assert.deepEqual(block, { type: 'tool_result', content: 'object result', is_error: false });
+      assert.equal(Object.hasOwn(block, 'tool_use_id'), false, 'an object id must not be written as tool_use_id');
+    }
+  });
+});
+
+test('T-ADV8-03: non-string synthesized tool-call callIds omit id and are not de-duped by reference identity', async () => {
+  await withRoot((root) => {
+    const manager = createTranscriptManager({ dir: root });
+    const writer = manager.writerFor('s1');
+    const objectId = { k: 1 };
+
+    writer.appendToolCall({ callId: null, name: 'read', arguments: '{"file_path":"/a"}' });
+    writer.appendToolCall({ callId: undefined, name: 'write', arguments: '{"file_path":"/b"}' });
+    writer.appendToolCall({ callId: objectId, name: 'read', arguments: '{"file_path":"/a"}' });
+    writer.appendToolCall({ callId: objectId, name: 'read', arguments: '{"file_path":"/a"}' });
+
+    const blocks = readLines(writer.path).map((line) => line.message.content[0]);
+    assert.equal(blocks.length, 4, 'a null/undefined/object callId has no identity to de-duplicate');
+    assert.deepEqual(blocks[0], { type: 'tool_use', name: 'read', input: { file_path: '/a' } });
+    assert.deepEqual(blocks[1], { type: 'tool_use', name: 'write', input: { file_path: '/b' } });
+    assert.deepEqual(blocks[2], { type: 'tool_use', name: 'read', input: { file_path: '/a' } });
+    assert.deepEqual(blocks[3], { type: 'tool_use', name: 'read', input: { file_path: '/a' } });
+    for (const block of blocks) {
+      assert.equal(Object.hasOwn(block, 'id'), false, 'a non-string callId must not be written as tool_use id');
+    }
+  });
+});
+
+test('T-ADV8-03 control: string ids still de-dupe exactly for results and synthesized calls', async () => {
+  await withRoot((root) => {
+    const manager = createTranscriptManager({ dir: root });
+    const writer = manager.writerFor('s1');
+
+    writer.appendToolResult({ callId: 'r1', content: 'same', isError: false });
+    writer.appendToolResult({ callId: 'r1', content: 'same', isError: false });
+    writer.appendToolResult({ callId: 'r1', content: 'different', isError: false });
+    writer.appendToolCall({ callId: 'c1', name: 'read', arguments: '{}' });
+    writer.appendToolCall({ callId: 'c1', name: 'read', arguments: '{}' });
+
+    const blocks = readLines(writer.path).map((line) => line.message.content[0]);
+    assert.deepEqual(blocks, [
+      { type: 'tool_result', tool_use_id: 'r1', content: 'same', is_error: false },
+      { type: 'tool_result', tool_use_id: 'r1', content: 'different', is_error: false },
+      { type: 'tool_use', id: 'c1', name: 'read', input: {} },
+    ], 'string ids keep exact de-duplication');
   });
 });
